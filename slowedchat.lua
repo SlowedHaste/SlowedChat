@@ -67,14 +67,14 @@ local layouts = {
         { id = 'main', title = 'Chat', tabs = {
             { name = 'All',      cats = ALL },
             { name = 'Combat',   cats = COMBAT },
-            { name = 'Messages', cats = MESSAGES },
+            { name = 'Messages', cats = MESSAGES, notify = true },
             { name = 'System',   cats = SYSTEM },
         } },
     },
     dual = {
         { id = 'main', title = 'Chat', tabs = {
             { name = 'General',  cats = NOCOMBAT },
-            { name = 'Messages', cats = MESSAGES },
+            { name = 'Messages', cats = MESSAGES, notify = true },
         } },
         { id = 'log', title = 'Log', tabs = {
             { name = 'Combat',   cats = COMBAT },
@@ -186,7 +186,7 @@ local function build_windows()
     for _, w in ipairs(layout) do
         local win = { id = w.id, title = w.title, tabs = { }, open = { true }, select = nil };
         for i, t in ipairs(w.tabs) do
-            local tab = { name = t.name, cats = t.cats, lines = { }, unread = false, scroll = true };
+            local tab = { name = t.name, cats = t.cats, notify = t.notify, lines = { }, unread = false, scroll = true };
             for _, e in ipairs(state.history) do
                 if (tab.cats[e.cat]) then
                     table.insert(tab.lines, e);
@@ -220,7 +220,9 @@ local function push_line(e)
                 if (#tab.lines > state.settings.max_lines) then
                     table.remove(tab.lines, 1);
                 end
-                if (win.active ~= i) then
+                -- Only tabs that opt in (Messages) get the unread marker; the busy
+                -- ones would always be lit..
+                if (tab.notify and win.active ~= i) then
                     tab.unread = true;
                 end
             end
