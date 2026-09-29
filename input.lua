@@ -88,6 +88,21 @@ input.menu_name = function ()
     return (ashita.memory.read_string(p + 0x46, 16):gsub('%z', ''):gsub('%s+$', ''));
 end
 
+-- Game menus that make the chat windows step back. (Short names, without the
+-- 'menu' prefix. Other menus leave the chat alone.)
+local FADE_MENUS = {
+    playermo = true,    -- Player menu. (Selecting yourself.)
+};
+
+--[[
+* Returns true if a game menu that the chat windows should step back for is open.
+--]]
+input.game_menu_open = function (s)
+    local name = input.menu_name();
+    local short = name:match('^menu%s+(.+)$') or name;
+    return FADE_MENUS[short] == true;
+end
+
 --[[
 * Returns the game's chat input state. IsInputOpen returns a ChatInputOpenStatus
 * number (0 = closed, 0x11 = chat line, 0x21 = bazaar/search comment), not a bool.

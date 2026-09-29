@@ -35,6 +35,8 @@ local default_settings = T{
     text_shadow     = true,
     inline_colors   = true,         -- Use the game's own colors for items, key items, etc.
     locked          = false,
+    menu_mode       = 'fade',       -- While a game menu is open: 'fade', 'hide' or 'off'.
+    menu_alpha      = 0.15,         -- Opacity when faded.
     show_mode_ids   = false,        -- Prefix lines with their chat mode id. (For '/schat map'.)
     windows = T{
         main = T{ x = 20,  y = 480, w = 520, h = 260, visible = true, tab = '' },
@@ -117,6 +119,7 @@ local state = {
     config_open = { false },
     party       = { },      -- Cached party/alliance member names.
     party_time  = 0,
+    fade        = 1.0,      -- Chat window opacity multiplier. (Lowered while game menus are open.)
     captured    = 0,        -- Lines captured this session. (For '/schat status'.)
     blocked     = 0,        -- Lines hidden from the game's log this session.
 };
@@ -359,6 +362,7 @@ ashita.events.register('command', 'command_cb', function (e)
         line('Custom input', s.custom_input);
         line('Game menu at last Enter press', ('"%s"'):fmt(input.last_enter_menu or '(none yet)'));
         line('Last reason Enter was left to the game', input.last_refusal or 'none');
+        line('Player menu open now (fades chat)',('%s "%s"'):fmt(tostring(input.game_menu_open(s)), input.menu_name()));
         local learned = T{ };
         for k, _ in pairs(s.chat_menus or { }) do
             learned:append(('"%s"'):fmt(k));
@@ -502,12 +506,33 @@ local function render_lines(tab, footer)
 end
 
 --[[
+* Eases the chat windows toward faded/hidden while a game menu is open.
+*
+* ImGui always draws above the game's own UI, so the windows can't sit behind a
+* menu; instead they fade (and let clicks through) or hide until it closes.
+--]]
+local function update_fade()
+    local s = state.settings;
+    local target = 1.0;
+    if (s.menu_mode ~= 'off' and not input.active and input.game_menu_open(s)) then
+        target = (s.menu_mode == 'hide') and 0.0 or s.menu_alpha;
+    end
+
+    local dt = imgui.GetIO().DeltaTime or 0.016;
+    state.fade = state.fade + (target - state.fade) * math.min(1.0, dt * 12.0);
+    if (math.abs(target - state.fade) < 0.01) then
+        state.fade = target;
+    end
+end
+
+--[[
 * Renders one chat window.
 --]]
 local function render_window(win)
     local s = state.settings;
     local ws = s.windows[win.id];
-    if (not ws.visible) then
+    -- Hidden, or stepped back while a game menu is open. (See update_fade)
+    if (not ws.visible or state.fade <= 0.01) then
         return;
     end
 
@@ -522,12 +547,18 @@ local function render_window(win)
         flags = bit.bor(flags, ImGuiWindowFlags_NoMove, ImGuiWindowFlags_NoResize);
     end
 
+    -- Let clicks through to the game while faded..
+    if (state.fade < 0.99) then
+        flags = bit.bor(flags, ImGuiWindowFlags_NoInputs);
+    end
+
     for _, c in ipairs(theme_colors) do
         imgui.PushStyleColor(c[1], c[2]);
     end
     for _, v in ipairs(theme_vars) do
         imgui.PushStyleVar(v[1], v[2]);
     end
+    imgui.PushStyleVar(ImGuiStyleVar_Alpha, state.fade);
 
     if (imgui.Begin(('%s##slowedchat_%s'):fmt(win.title, win.id), win.open, flags)) then
         -- Remember position/size so they survive reloads..
@@ -594,7 +625,7 @@ local function render_window(win)
     end
     imgui.End();
 
-    imgui.PopStyleVar(#theme_vars);
+    imgui.PopStyleVar(#theme_vars + 1);
     imgui.PopStyleColor(#theme_colors);
 end
 
@@ -675,6 +706,22 @@ local function render_config()
         checkbox('Text shadow', 'text_shadow');
         checkbox('Use game colors for items / key items', 'inline_colors');
         checkbox('Lock windows', 'locked');
+
+        imgui.Text('While the player menu is open:');
+        for _, m in ipairs({ { 'fade', 'Fade' }, { 'hide', 'Hide' }, { 'off', 'Stay visible' } }) do
+            imgui.SameLine();
+            if (imgui.RadioButton(m[2] .. '##menu_mode', s.menu_mode == m[1])) then
+                s.menu_mode = m[1];
+                changed = true;
+            end
+        end
+        if (s.menu_mode == 'fade') then
+            local fa = { s.menu_alpha };
+            if (imgui.SliderFloat('Faded opacity', fa, 0.0, 0.8, '%.2f')) then
+                s.menu_alpha = fa[1];
+                changed = true;
+            end
+        end
         checkbox('Show chat mode ids (debug)', 'show_mode_ids');
 
         imgui.Separator();
@@ -741,6 +788,8 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     input.update(state.settings, function ()
         settings.save();
     end);
+
+    update_fade();
 
     for _, win in ipairs(state.windows) do
         render_window(win);
