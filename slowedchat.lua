@@ -1,6 +1,6 @@
 addon.name      = 'slowedchat';
-addon.author    = 'panda';
-addon.version   = '0.3';
+addon.author    = 'Slowed';
+addon.version   = '0.4';
 addon.desc      = 'WoW-style tabbed chat windows.';
 addon.link      = '';
 
@@ -15,6 +15,9 @@ local palette   = require 'palette';
 local render    = require 'render';
 local input     = require 'input';
 local nativechat = require 'nativechat';
+local fonts     = require 'fonts';
+local hud       = require 'hud';
+local autotranslate = require 'autotranslate';
 
 -- Default Settings
 local default_settings = T{
@@ -22,21 +25,28 @@ local default_settings = T{
     hide_native     = false,        -- Block captured lines from the game's own chat log.
     hide_npc        = false,        -- Also hide NPC dialog. (Off: some NPCs rely on the game's log.)
     hide_window     = false,        -- Hide the game's chat log windows themselves. (Memory write; see nativechat.lua)
+    hide_compass    = true,         -- Hide the game's compass and clock. (Code patch; see hud.lua)
+    show_time       = true,         -- Show Vana'diel day/time in the chat window's tab row.
     custom_input    = true,         -- Enter / '/' opens slowedchat's input instead of the game's.
     chat_channel    = 'say',        -- Last sticky input channel.
     tell_target     = '',           -- Last tell target, when chat_channel is 'tell'.
     chat_menus      = T{ },         -- Game menus where Enter opens chat. (Learned automatically.)
+    menu_fade       = T{ },         -- [menu name] = true/false: your '/schat fade' choices. (See input.game_menu_open)
     timestamps      = true,
     timestamp_fmt   = '[%H:%M]',
     max_lines       = 300,          -- Lines kept per tab.
-    font_scale      = 1.0,
+    font_family     = 'Segoe UI',   -- See fonts.lua. 'Default' is Ashita's ImGui font.
+    text_size       = 0,            -- Pixels; 0 = match Ashita's ImGui font size.
+    text_effect     = 'outline',    -- 'outline', 'shadow' or 'none'.
+    message_style   = 'wow',        -- 'wow' ("[Party] Name: hi") or 'ffxi' ("(Name) hi").
+    mention_highlight = true,       -- Highlight lines where someone says your name.
     bg_alpha        = 0.60,         -- Background opacity while hovered / typing.
     hover_reveal    = true,         -- Dim the background and chrome while the mouse is elsewhere.
     idle_bg_alpha   = 0.20,         -- Background opacity while idle. (With hover_reveal.)
+    lines_shade     = 0.20,         -- Constant dark shade behind the message lines.
     speaker_names   = true,         -- Draw speaker names a shade brighter than the message.
     line_gap        = 2,            -- Extra pixels between lines.
     wrap_indent     = 12,           -- Indent for wrapped continuation rows.
-    text_shadow     = true,
     inline_colors   = true,         -- Use the game's own colors for items, key items, etc.
     locked          = false,
     menu_mode       = 'fade',       -- While a game menu is open: 'fade', 'hide' or 'off'.
@@ -95,9 +105,12 @@ local NUMBER_STYLES = cats('combat', 'dealt', 'taken', 'heal', 'crit', 'skillcha
 -- 'reveal' (0 = idle, 1 = hovered / typing).
 local ACCENT = { 1.00, 0.82, 0.00 };
 
-local function theme_colors(reveal)
+local function theme_colors(reveal, s)
     return {
         { ImGuiCol_WindowBg,             { 0.03, 0.03, 0.045, 1.00 } },
+        -- The lines area is a child window: a light, constant shade behind the
+        -- text for readability (see lines_shade), on top of the window background.
+        { ImGuiCol_ChildBg,              { 0.00, 0.00, 0.00, s.lines_shade or 0.20 } },
         { ImGuiCol_Border,               { 1.00, 1.00, 1.00, 0.09 * reveal } },
         { ImGuiCol_ScrollbarBg,          { 0.00, 0.00, 0.00, 0.00 } },
         { ImGuiCol_ScrollbarGrab,        { 1.00, 1.00, 1.00, 0.20 * reveal } },
@@ -116,16 +129,17 @@ local theme_vars = {
     { ImGuiStyleVar_FramePadding,     { 8, 3 } },
 };
 
--- Speaker prefixes per category, highlighted as the 'speaker' style.
+-- Speaker prefixes per category: { pattern capturing the name, WoW-style label }.
+-- Labels ending in 's' are verbs ("Name says:"), the rest are tags ("[Party] Name:").
 local SPEAKERS = {
-    say        = { '^[^%s:]+ : ' },
-    shout      = { '^[^%s:]+ : ' },
-    yell       = { '^[^%s%[]+%[[^%]]*%]: ', '^[^%s:]+ : ' },
-    party      = { '^%([^%)]+%) ' },
-    linkshell  = { '^<[^>]+> ' },
-    linkshell2 = { '^%[2%]<[^>]+> ', '^<[^>]+> ' },
-    unity      = { '^{[^}]+} ' },
-    tell       = { '^[^%s>]+>> ', '^>>[^%s:]+ : ' },
+    say        = { { '^([^%s:]+) : ', 'says' } },
+    shout      = { { '^([^%s:]+) : ', 'shouts' } },
+    yell       = { { '^([^%s%[]+)%[[^%]]*%]: ', 'yells' }, { '^([^%s:]+) : ', 'yells' } },
+    party      = { { '^%(([^%)]+)%) ', 'Party' } },
+    linkshell  = { { '^<([^>]+)> ', 'LS' } },
+    linkshell2 = { { '^%[2%]<([^>]+)> ', 'LS2' }, { '^<([^>]+)> ', 'LS2' } },
+    unity      = { { '^{([^}]+)} ', 'Unity' } },
+    tell       = { { '^([^%s>]+)>> ', 'From' }, { '^>>([^%s:]+) : ', 'To' } },
 };
 
 -- Addon State
@@ -140,6 +154,39 @@ local state = {
     captured    = 0,        -- Lines captured this session. (For '/schat status'.)
     blocked     = 0,        -- Lines hidden from the game's log this session.
 };
+
+--[[
+* Writes an error (once per distinct message) to error.log in the addon folder.
+* Errors can't be shown reliably in chat: they would be routed through the
+* failing chat window, and the game's log may be hidden.
+--]]
+local logged_errors = { };
+local function log_error(where, err)
+    local msg = tostring(err);
+    if (logged_errors[msg]) then
+        return;
+    end
+    logged_errors[msg] = true;
+    state.last_error = ('%s: %s'):fmt(where, msg:match('^[^\n]*'));
+
+    local dir = addon.path or (AshitaCore:GetInstallPath():gsub('\\$', '') .. '\\addons\\slowedchat\\');
+    local f = io.open(dir:gsub('[\\/]$', '') .. '\\error.log', 'a');
+    if (f ~= nil) then
+        f:write(('[%s] %s\n%s\n\n'):fmt(os.date('%Y-%m-%d %H:%M:%S'), where, msg));
+        f:close();
+    end
+end
+
+--[[
+* Runs fn, logging any error instead of letting it stop the addon's event.
+--]]
+local function trap(where, fn, ...)
+    local ok, err = xpcall(fn, debug.traceback, ...);
+    if (not ok) then
+        log_error(where, err);
+    end
+    return ok;
+end
 
 --[[
 * Returns the names of the player's party and alliance members. (Cached for a second.)
@@ -172,13 +219,15 @@ local function build_spans(parsed, style, cat)
     local out = { };
     local numbers = NUMBER_STYLES[style];
 
-    -- Split the speaker prefix ("(Name) ", "<Name> ", "Name>> " ...) into its own span..
+    -- Pull the speaker prefix ("(Name) ", "<Name> ", "Name>> " ...) out of the
+    -- message; the renderer draws it in the FFXI or WoW style. (See render.lua)
+    local speaker = nil;
     local first = parsed[1];
     if (first ~= nil and first.fx == nil and SPEAKERS[cat] ~= nil) then
-        for _, pattern in ipairs(SPEAKERS[cat]) do
-            local _, b = first.text:find(pattern);
+        for _, sp in ipairs(SPEAKERS[cat]) do
+            local _, b, name = first.text:find(sp[1]);
             if (b ~= nil) then
-                out[#out + 1] = { text = first.text:sub(1, b), key = 'speaker' };
+                speaker = { prefix = first.text:sub(1, b), name = name, label = sp[2] };
                 parsed = { { text = first.text:sub(b + 1), fx = nil }, unpack(parsed, 2) };
                 break;
             end
@@ -203,7 +252,30 @@ local function build_spans(parsed, style, cat)
             out[#out + 1] = { text = sp.text, key = key };
         end
     end
-    return out;
+    return out, speaker;
+end
+
+--[[
+* Returns true if someone else's chat line mentions the player by name.
+--]]
+local function mentions_me(speaker, text)
+    local me = AshitaCore:GetMemoryManager():GetParty():GetMemberName(0);
+    if (speaker == nil or me == nil or #me == 0 or speaker.name == me) then
+        return false;
+    end
+    local body = text:sub(#speaker.prefix + 1):lower();
+    local name = me:lower();
+    local a, b = body:find(name, 1, true);
+    while (a ~= nil) do
+        -- Whole word only..
+        local before = (a > 1) and body:sub(a - 1, a - 1) or ' ';
+        local after = body:sub(b + 1, b + 1);
+        if (not before:match('%w') and not after:match('%w')) then
+            return true;
+        end
+        a, b = body:find(name, b + 1, true);
+    end
+    return false;
 end
 
 --[[
@@ -305,7 +377,8 @@ local function print_help(isError)
         { '/schat', 'Toggles the settings window.' },
         { '/schat layout (single | dual)', 'One tabbed window, or Chat + Log windows.' },
         { '/schat native', 'Toggles hiding the game\'s own chat log.' },
-        { '/schat window', 'Toggles hiding the game\'s chat windows themselves.' },
+        { '/schat fade', 'With a game menu open: toggles whether that menu fades the chat.' },
+        { '/schat window','Toggles hiding the game\'s chat windows themselves.' },
         { '/schat input','Toggles using slowedchat\'s input bar instead of the game\'s.' },
         { '/schat status', 'Prints diagnostic information.' },
         { '/schat lock', 'Toggles locking the chat windows in place.' },
@@ -325,6 +398,8 @@ end
 * event: load
 --]]
 ashita.events.register('load', 'load_cb', function ()
+    -- Fonts must be added here, never mid-frame. (See fonts.lua)
+    fonts.prewarm();
     build_windows();
     input.restore(state.settings);
 end);
@@ -334,6 +409,7 @@ end);
 --]]
 ashita.events.register('unload', 'unload_cb', function ()
     nativechat.restore();
+    hud.restore();
     settings.save();
 end);
 
@@ -373,6 +449,30 @@ ashita.events.register('command', 'command_cb', function (e)
         return;
     end
 
+    -- Handle: /schat fade - Toggles whether the game menu that's open now fades the chat.
+    if (args[2]:any('fade')) then
+        local name = input.menu_name();
+        local short = input.short_name(name);
+        if (name == '' or short == 'inline' or (s.chat_menus and s.chat_menus[name])) then
+            print(chat.header(addon.name):append(chat.error('No game menu is open. Open the menu first, then press / and type /schat fade.')));
+            return;
+        end
+
+        -- Flip whatever it does now; drop the choice when it matches the default..
+        s.menu_fade = s.menu_fade or T{ };
+        local fades = not input.game_menu_open(s);
+        local default = not input.right_side(name);
+        if (fades == default) then
+            s.menu_fade[name] = nil;
+        else
+            s.menu_fade[name] = fades;
+        end
+
+        print(chat.header(addon.name):append(chat.message(fades and 'Chat now fades for: ' or 'Chat no longer fades for: ')):append(chat.success(short)));
+        settings.save();
+        return;
+    end
+
     if (args[2]:any('window')) then
         s.hide_window = not s.hide_window;
         settings.save();
@@ -398,13 +498,20 @@ ashita.events.register('command', 'command_cb', function (e)
         line('Custom input', s.custom_input);
         line('Game menu at last Enter press', ('"%s"'):fmt(input.last_enter_menu or '(none yet)'));
         line('Last reason Enter was left to the game', input.last_refusal or 'none');
-        line('Player menu open now (fades chat)',('%s "%s"'):fmt(tostring(input.game_menu_open(s)), input.menu_name()));
+        local choices = T{ };
+        for k, v in pairs(s.menu_fade or { }) do
+            choices:append(('%s %s'):fmt(input.short_name(k), v and '(fades)' or '(doesn\'t fade)'));
+        end
+        line('Menu fade overrides', #choices > 0 and choices:concat(', ') or 'none (all menus fade except right-side lists)');
+        line('Game menu open now (fades chat)', ('%s "%s"'):fmt(tostring(input.game_menu_open(s)), input.menu_name()));
         local learned = T{ };
         for k, _ in pairs(s.chat_menus or { }) do
             learned:append(('"%s"'):fmt(k));
         end
         line('Learned chat menus', #learned > 0 and learned:concat(', ') or 'none');        line('Game input state', tostring(AshitaCore:GetChatManager():IsInputOpen()));
         line('Last capture error', state.last_error or 'none');
+        line('Auto-translate phrases', autotranslate.error and ('off - ' .. autotranslate.error)
+            or (autotranslate.ready and #autotranslate.list or 'not checked yet'));
         if (s.hide_native) then
             print(chat.header(addon.name):append(chat.warning('TEST LINE: if you can read this in the game\'s own chat log, hiding is not working.')));
         end
@@ -472,7 +579,10 @@ ashita.events.register('text_in', 'text_in_cb', function (e)
 
     -- Printing from here can deadlock, so errors are kept for '/schat status' instead..
     local ok, err = pcall(function ()
-        local parsed, text = cleaner.parse(e.message_modified);
+        -- Read the line as the game sent it, before other addons touched it:
+        -- e.g. the timestamp addon prefixes a colored stamp that would hide the
+        -- speaker. (slowedchat draws its own timestamps.)
+        local parsed, text = cleaner.parse(e.message);
         if (#text == 0) then
             return;
         end
@@ -482,13 +592,16 @@ ashita.events.register('text_in', 'text_in_cb', function (e)
         local style = modes.style(cat, text, party_names());
         input.on_line(mode, text);
         state.captured = state.captured + 1;
+        local spans, speaker = build_spans(parsed, style, cat);
         push_line({
-            time  = os.time(),
-            mode  = mode,
-            cat   = cat,
-            style = style,
-            text  = text,
-            spans = build_spans(parsed, style, cat),
+            time    = os.time(),
+            mode    = mode,
+            cat     = cat,
+            style   = style,
+            text    = text,
+            spans   = spans,
+            speaker = speaker,
+            mention = mentions_me(speaker, text),
         });
     end);
 
@@ -509,15 +622,15 @@ end);
 * desc  : Opens slowedchat's input on Enter or '/' and keeps keys from the game while typing.
 --]]
 ashita.events.register('key', 'key_cb', function (e)
-    input.on_key(e, state.settings);
+    trap('key', input.on_key, e, state.settings);
 end);
 
 ashita.events.register('key_data', 'key_data_cb', function (e)
-    input.on_key_data(e, state.settings);
+    trap('key_data', input.on_key_data, e, state.settings);
 end);
 
 ashita.events.register('key_state', 'key_state_cb', function (e)
-    input.on_key_state(e, state.settings);
+    trap('key_state', input.on_key_state, e, state.settings);
 end);
 
 --[[
@@ -568,8 +681,11 @@ local function render_lines(tab, footer)
     local at_bottom = imgui.GetScrollY() >= imgui.GetScrollMaxY() - 2;
 
     imgui.PushStyleVar(ImGuiStyleVar_ItemSpacing, { 0, state.settings.line_gap });
-    render.lines(tab.lines, state.settings, copy_line);
+    render.lines(tab.lines, state.settings, copy_line, state.font_ctx);
     imgui.PopStyleVar();
+
+    -- Breathing room under the newest line..
+    imgui.Dummy({ 0, 6 });
 
     if (at_bottom or tab.scroll) then
         imgui.SetScrollHereY(1.0);
@@ -676,6 +792,30 @@ local function render_tabs(win, ws, reveal)
         dl:AddRectFilled({ cx - 5, cy + k * 4 - 0.5 }, { cx + 5, cy + k * 4 + 1 }, bc, 0.5);
     end
 
+    -- Vana'diel day and time, right-aligned before the settings button. (Main
+    -- window only; the day name is dropped first when space runs out.)
+    if (s.show_time and win.id == 'main') then
+        local hh, mm, d = hud.vana_time();
+        local day = hud.DAYS[d] or hud.DAYS[0];
+        local time = ('%02d:%02d'):fmt(hh, mm);
+        local tw = imgui.CalcTextSize(time);
+        local dw = imgui.CalcTextSize(day[1] .. '  ');
+        local ty = y0 + (fh - lh) * 0.5;
+        local right = bx - 6;
+
+        local show_day = (right - tw - dw) > x + 8;
+        if (show_day or (right - tw) > x + 8) then
+            local tx = right - tw;
+            if (show_day) then
+                local c = day[2];
+                dl:AddText(font, fs, { tx - dw + 1, ty + 1 }, u32(0, 0, 0, 0.7), day[1]);
+                dl:AddText(font, fs, { tx - dw, ty }, u32(c[1], c[2], c[3], 0.75 + 0.25 * reveal), day[1]);
+            end
+            dl:AddText(font, fs, { tx + 1, ty + 1 }, u32(0, 0, 0, 0.7), time);
+            dl:AddText(font, fs, { tx, ty }, u32(0.85, 0.85, 0.88, 0.75 + 0.25 * reveal), time);
+        end
+    end
+
     -- Hairline under the strip..
     dl:AddLine({ x0, y0 + fh + 0.5 }, { x0 + avail, y0 + fh + 0.5 }, u32(1, 1, 1, 0.06 + 0.06 * reveal), 1.0);
 
@@ -691,7 +831,7 @@ end
 local function update_fade()
     local s = state.settings;
     local target = 1.0;
-    if (s.menu_mode ~= 'off' and not input.active and input.game_menu_open(s)) then
+    if (s.menu_mode ~= 'off' and not input.active and (input.game_menu_open(s) or input.event_active())) then
         target = (s.menu_mode == 'hide') and 0.0 or s.menu_alpha;
     end
 
@@ -738,7 +878,7 @@ local function render_window(win)
         flags = bit.bor(flags, ImGuiWindowFlags_NoInputs);
     end
 
-    local colors = theme_colors(reveal);
+    local colors = theme_colors(reveal, s);
     for _, c in ipairs(colors) do
         imgui.PushStyleColor(c[1], c[2]);
     end
@@ -762,10 +902,10 @@ local function render_window(win)
         -- Hover state drives the reveal fade next frame..
         win.hovered = imgui.IsWindowHovered(bit.bor(ImGuiHoveredFlags_RootAndChildWindows, ImGuiHoveredFlags_AllowWhenBlockedByActiveItem));
 
-        local pushed = false;
-        if (s.font_scale ~= 1.0) then
-            pushed = pcall(imgui.PushFont, imgui.GetFont(), imgui.GetFontSize() * s.font_scale);
-        end
+        -- Chat font for the whole window (tabs, lines, input)..
+        local regular, strong = fonts.get(s.font_family);
+        local pushed = pcall(imgui.PushFont, regular or imgui.GetFont(), fonts.size(s.text_size));
+        state.font_ctx = { regular = imgui.GetFont(), strong = strong, size = imgui.GetFontSize() };
 
         render_tabs(win, ws, reveal);
 
@@ -891,18 +1031,57 @@ local function render_config()
             if (s.hover_reveal) then
                 slider('Idle background opacity', 'idle_bg_alpha', 0.0, 1.0, '%.2f');
             end
-            slider('Font scale', 'font_scale', 0.5, 2.0, '%.2f');
+            slider('Shade behind text', 'lines_shade', 0.0, 0.8, '%.2f');
+            imgui.Spacing();
+        end
+
+        if (imgui.CollapsingHeader('Text', open)) then
+            -- Font family..
+            if (imgui.BeginCombo('Font', s.font_family)) then
+                for _, f in ipairs(fonts.families) do
+                    if (fonts.available(f.name) and imgui.Selectable(f.name, s.font_family == f.name)) then
+                        s.font_family = f.name;
+                        changed = true;
+                    end
+                end
+                imgui.EndCombo();
+            end
+            slider('Font size', 'text_size', 0, 32, nil, true);
+            imgui.SameLine();
+            imgui.TextDisabled(s.text_size == 0 and ('(auto: %d px)'):fmt(fonts.size(0)) or '(0 = auto)');
             slider('Line spacing', 'line_gap', 0, 10, nil, true);
+
+            imgui.Text('Text effect:');
+            for _, m in ipairs({ { 'outline', 'Outline' }, { 'shadow', 'Shadow' }, { 'none', 'None' } }) do
+                imgui.SameLine();
+                if (imgui.RadioButton(m[2] .. '##effect', s.text_effect == m[1])) then
+                    s.text_effect = m[1];
+                    changed = true;
+                end
+            end
+
+            imgui.Text('Names:');
+            for _, m in ipairs({ { 'wow', '[Party] Name: hi' }, { 'ffxi', '(Name) hi' } }) do
+                imgui.SameLine();
+                if (imgui.RadioButton(m[2] .. '##style', s.message_style == m[1])) then
+                    s.message_style = m[1];
+                    changed = true;
+                end
+            end
+
+            checkbox('Bold, brighter speaker names', 'speaker_names');
+            checkbox('Highlight lines that mention you', 'mention_highlight');
             checkbox('Show timestamps', 'timestamps');
-            checkbox('Highlight speaker names', 'speaker_names');
-            checkbox('Text shadow', 'text_shadow');
             checkbox('Use game colors for items / key items', 'inline_colors');
+            if (s.font_family ~= 'Default') then
+                imgui.TextDisabled('If Japanese text shows as "?", try the Default font.');
+            end
             imgui.Spacing();
         end
 
         if (imgui.CollapsingHeader('Behavior', open)) then
             checkbox('Type in slowedchat  (Enter / \'/\' opens its input bar)', 'custom_input');
-            imgui.Text('While the player menu is open:');
+            imgui.Text('While a game menu or NPC dialog is open:');
             for _, m in ipairs({ { 'fade', 'Fade' }, { 'hide', 'Hide' }, { 'off', 'Stay visible' } }) do
                 imgui.SameLine();
                 if (imgui.RadioButton(m[2] .. '##menu_mode', s.menu_mode == m[1])) then
@@ -920,6 +1099,9 @@ local function render_config()
         if (imgui.CollapsingHeader('Game chat', open)) then
             checkbox('Hide the game\'s chat windows', 'hide_window');
             hint(('(%s)'):fmt(nativechat.status));
+            checkbox('Hide the game\'s compass and clock', 'hide_compass');
+            hint(('(%s)'):fmt(hud.status));
+            checkbox('Show Vana\'diel time in the chat window', 'show_time');
             checkbox('Hide lines from the game\'s chat log', 'hide_native');
             if (s.hide_native) then
                 imgui.Indent();
@@ -967,8 +1149,15 @@ end
 --[[
 * event: d3d_present
 --]]
+local present;
+
 ashita.events.register('d3d_present', 'present_cb', function ()
+    trap('present', present);
+end);
+
+present = function ()
     nativechat.tick(state.settings.hide_window);
+    hud.tick(state.settings.hide_compass);
 
     -- Hide while the player is not logged in..
     local player = GetPlayerEntity();
@@ -976,11 +1165,14 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         return;
     end
 
-    input.update(state.settings, function ()
+    -- Confirm the auto-translate code format once. (See autotranslate.lua)
+    trap('autotranslate', autotranslate.step);
+
+    trap('input.update', input.update, state.settings, function ()
         settings.save();
     end);
 
-    update_fade();
+    trap('update_fade', update_fade);
 
     for _, win in ipairs(state.windows) do
         render_window(win);
@@ -998,4 +1190,4 @@ ashita.events.register('d3d_present', 'present_cb', function ()
         state.pending_save = false;
         settings.save();
     end
-end);
+end

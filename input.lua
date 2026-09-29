@@ -13,6 +13,7 @@ local imgui   = require 'imgui';
 local chat    = require 'chat';
 local cleaner = require 'cleaner';
 local palette = require 'palette';
+local at      = require 'autotranslate';
 
 local input = {
     active      = false,    -- Input bar is open.
@@ -88,19 +89,48 @@ input.menu_name = function ()
     return (ashita.memory.read_string(p + 0x46, 16):gsub('%z', ''):gsub('%s+$', ''));
 end
 
--- Game menus that make the chat windows step back. (Short names, without the
--- 'menu' prefix. Other menus leave the chat alone.)
-local FADE_MENUS = {
-    playermo = true,    -- Player menu. (Selecting yourself.)
+-- Game menus that do NOT fade the chat: they open on the right side of the
+-- screen, away from it. (Short names, without the 'menu' prefix; from XIUI's
+-- menu list.) Every other menu (player menu, NPC options, Yes/No confirmations,
+-- Mog House ...) fades it. '/schat fade' overrides either way. (s.menu_fade)
+local RIGHT_SIDE_MENUS = {
+    magselec = true,    -- Magic side menu.
+    magic    = true,    -- Magic / Trust list.
+    abiselec = true,    -- Abilities side menu.
+    ability  = true,    -- Job abilities, weapon skills, pet commands.
+    mount    = true,    -- Mount list.
 };
 
 --[[
-* Returns true if a game menu that the chat windows should step back for is open.
+* Returns the short name of a game menu. ('menu    myroom' -> 'myroom')
+--]]
+input.short_name = function (name)
+    return name:match('^menu%s+(.+)$') or name;
+end
+
+--[[
+* Returns true if the chat should step back for the game menu that's open.
 --]]
 input.game_menu_open = function (s)
     local name = input.menu_name();
-    local short = name:match('^menu%s+(.+)$') or name;
-    return FADE_MENUS[short] == true;
+    local short = input.short_name(name);
+
+    -- No menu, an idle state, or the game's chat line..
+    if (name == '' or short == 'inline' or (s.chat_menus ~= nil and s.chat_menus[name])) then
+        return false;
+    end
+
+    -- Your choice from '/schat fade' wins; otherwise right-side menus don't fade..
+    local choice = s.menu_fade and s.menu_fade[name];
+    if (choice ~= nil) then
+        return choice;
+    end
+    return not RIGHT_SIDE_MENUS[short];
+end
+
+-- True if a menu is excluded by default. (For '/schat fade' / status.)
+input.right_side = function (name)
+    return RIGHT_SIDE_MENUS[input.short_name(name)] == true;
 end
 
 --[[
@@ -126,6 +156,9 @@ local function event_active()
     local p = ashita.memory.read_uint32(pEventSystem + 1);
     return p ~= 0 and ashita.memory.read_uint8(p) == 1;
 end
+
+-- True while an NPC event (dialog, cutscene) is running.
+input.event_active = event_active;
 
 --[[
 * Returns true if another addon's ImGui text box is being typed in. (ImGui still
@@ -224,7 +257,8 @@ end
 local function send(cmd)
     -- AshitaParse (-1): Ashita and addons (/schat, /addon ...) see the command
     -- first; anything they don't handle is forwarded to the game.
-    AshitaCore:GetChatManager():QueueCommand(-1, cleaner.to_sjis(cmd));
+    -- {Phrase} becomes a real auto-translate code; the rest goes to Shift-JIS..
+    AshitaCore:GetChatManager():QueueCommand(-1, at.encode(cmd));
 end
 
 --[[
@@ -320,6 +354,93 @@ end
 * new id and refocused to pick up the new text. (InputText callbacks are avoided;
 * they truncated the typed text with Ashita's binding.)
 --]]
+--[[
+* Returns the auto-translate token being typed: text after the last unclosed '{'.
+* (braced = true), or nil when there isn't one.
+--]]
+local function open_brace(text)
+    local open = text:match('.*(){[^{}]*$');
+    if (open == nil) then
+        return nil, nil;
+    end
+    return text:sub(1, open - 1), text:sub(open + 1);
+end
+
+--[[
+* Replaces the input text and refocuses so ImGui picks it up. (ImGui ignores
+* buffer changes while an input is active; a new id makes it re-read.)
+--]]
+local function set_text(text)
+    input.buf[1] = text;
+    input.gen = input.gen + 1;
+    input.focus = true;
+    input.to_end = true;
+end
+
+--[[
+* Tab: completes the auto-translate phrase being typed ('{war' or 'war'),
+* cycling through matches on repeated presses, like the game's own chat.
+--]]
+local function complete(text)
+    local c = input.cycle;
+    if (c ~= nil and c.result == text) then
+        c.i = (c.i % #c.list) + 1;
+    else
+        local base, token = open_brace(text);
+        if (base == nil) then
+            base, token = text:match('^(.-)(%S*)$');
+        end
+        local list = (#token > 0) and at.matches(token, 30) or { };
+        if (#list == 0) then
+            input.cycle = nil;
+            set_text(text);
+            return;
+        end
+        c = { base = base, list = list, i = 1 };
+        input.cycle = c;
+    end
+    c.result = ('%s{%s} '):fmt(c.base, c.list[c.i].name);
+    set_text(c.result);
+end
+
+--[[
+* Draws the phrase suggestions above the input while a '{' phrase is typed.
+--]]
+local function draw_suggestions(x, y, typed)
+    local _, token = open_brace(typed);
+    if (token == nil or #token == 0) then
+        return;
+    end
+    local list = at.matches(token, 6);
+    if (#list == 0) then
+        return;
+    end
+
+    local dl = imgui.GetForegroundDrawList();
+    local font, fs = imgui.GetFont(), imgui.GetFontSize();
+    local lh = imgui.GetTextLineHeight();
+    local row = lh + 4;
+    local w = 0;
+    for _, e in ipairs(list) do
+        w = math.max(w, imgui.CalcTextSize('{' .. e.name .. '}'));
+    end
+    w = w + 60;
+    local h = #list * row + 6;
+    local top = y - h - 4;
+
+    dl:AddRectFilled({ x, top }, { x + w, top + h }, imgui.GetColorU32({ 0.05, 0.05, 0.07, 0.95 }), 5.0);
+    dl:AddRect({ x, top }, { x + w, top + h }, imgui.GetColorU32({ 1, 1, 1, 0.12 }), 5.0, ImDrawFlags_None, 1.0);
+    local green = imgui.GetColorU32(palette.get('autotrans') or { 0.56, 0.89, 0.63, 1 });
+    for i, e in ipairs(list) do
+        local ry = top + 3 + (i - 1) * row;
+        if (i == 1) then
+            dl:AddRectFilled({ x + 3, ry }, { x + w - 3, ry + row }, imgui.GetColorU32({ 1, 1, 1, 0.08 }), 3.0);
+            dl:AddText(font, fs, { x + w - 34, ry + 2 }, imgui.GetColorU32({ 0.6, 0.6, 0.65, 1 }), 'Tab');
+        end
+        dl:AddText(font, fs, { x + 8, ry + 2 }, green, '{' .. e.name .. '}');
+    end
+end
+
 local function history_step(dir)
     local n = #input.history;
     if (n == 0) then
@@ -420,9 +541,26 @@ input.render = function (s)
         input.focus = false;
     end
 
-    local entered = imgui.InputText(('##slowedchat_input%d'):fmt(input.gen), input.buf, MAX_INPUT, ImGuiInputTextFlags_EnterReturnsTrue);
+    -- AllowTabInput: Tab types a '\t' (caught below for completion) instead of
+    -- moving focus out of the input.
+    local iflags = bit.bor(ImGuiInputTextFlags_EnterReturnsTrue, ImGuiInputTextFlags_AllowTabInput);
+    local entered = imgui.InputText(('##slowedchat_input%d'):fmt(input.gen), input.buf, MAX_INPUT, iflags);
     local is_active = imgui.IsItemActive();
     local deactivated = imgui.IsItemDeactivated();
+
+    -- Tab pressed: complete the auto-translate phrase..
+    if (input.buf[1]:find('\t', 1, true)) then
+        imgui.PopStyleColor(5);
+        imgui.PopStyleVar(2);
+        imgui.PopItemWidth();
+        complete((input.buf[1]:gsub('\t', '')));
+        return;
+    end
+
+    if (is_active and not entered) then
+        -- Never let the suggestion list break the input bar..
+        pcall(draw_suggestions, px, py, input.buf[1]);
+    end
 
     imgui.PopStyleColor(5);
     imgui.PopStyleVar(2);
@@ -449,7 +587,8 @@ input.render = function (s)
     end
 
     if (entered) then
-        local text = input.buf[1];
+        local text = input.buf[1]:gsub('\t', '');
+        input.cycle = nil;
         input.close(true);
         hold(DIK_RETURN, DIK_NUMPADENT);
         submit(s, text);

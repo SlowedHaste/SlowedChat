@@ -11,43 +11,44 @@ local palette = { };
 
 -- Default colors. (Channel colors follow WoW's defaults where there is an equivalent.)
 palette.defaults = {
-    -- Channels
-    say         = 'FFFFFF',
-    emote       = 'FF8040',
-    shout       = 'FFA64D',
-    yell        = 'FF4040',
-    tell        = 'FF80FF',
-    party       = 'AAAAFF',
-    linkshell   = '40FF40',
-    linkshell2  = '40C080',
-    unity       = 'FFC0C0',
-    npc         = 'FFFF9F',
+    -- Channels (WoW hues, softened a touch for long reading on a dark background)
+    say         = 'F2F2F2',
+    emote       = 'FF9A5C',
+    shout       = 'FFB070',
+    yell        = 'FF5E5E',
+    tell        = 'F48CFF',
+    party       = 'A3B5FF',
+    linkshell   = '78E678',
+    linkshell2  = 'B4E06A',
+    unity       = 'FFC48A',
+    npc         = 'EFE4A8',
 
     -- System
-    system      = 'FFF08A',
-    loot        = '1EFF00',
-    gil         = 'FFD700',
-    xp          = '8C8CFF',
-    error       = 'FF4D4D',
+    system      = 'F5DE86',
+    loot        = '5EDC5E',
+    gil         = 'FFD24D',
+    xp          = '9E9EFF',
+    error       = 'FF6A6A',
 
     -- Combat
-    combat      = 'B4B4B4',
-    dealt       = 'EDEDED',
-    taken       = 'FF7070',
-    number      = 'FFE14D',
-    miss        = '7F7F7F',
-    heal        = '66FF66',
-    buff        = '66CCFF',
-    fade        = '9A9AC0',
-    ability     = 'FFB266',
-    spell       = 'C0A6FF',
-    crit        = 'FF9933',
-    defeat      = 'FFD100',
-    skillchain  = 'FF66FF',
+    combat      = 'A8A8AE',
+    dealt       = 'E6E6EA',
+    taken       = 'FF7C7C',
+    number      = 'FFE066',
+    miss        = '76767C',
+    heal        = '72E072',
+    buff        = '7CC8FF',
+    fade        = '9C9CC2',
+    ability     = 'FFBA70',
+    spell       = 'C9AAFF',
+    crit        = 'FF9D3B',
+    defeat      = 'FFCC33',
+    skillchain  = 'F07CFF',
 
     -- Interface
-    timestamp   = '808080',
-    modeid      = '5A5A5A',
+    autotrans   = '8FE3A0',   -- Auto-translate phrases. ({Warrior}, {Looking for Party} ...)
+    timestamp   = '6C6C76',
+    modeid      = '55555C',
 };
 
 -- Groups/labels for the settings window.
@@ -69,7 +70,7 @@ palette.groups = {
         { 'skillchain', 'Skillchain / MB' },
     } },
     { 'Interface', {
-        { 'timestamp', 'Timestamps' }, { 'modeid', 'Mode ids' },
+        { 'autotrans', 'Auto-translate' }, { 'timestamp', 'Timestamps' }, { 'modeid', 'Mode ids' },
     } },
 };
 

@@ -84,6 +84,7 @@ cleaner.parse = function (raw)
     local spans = { };
     local buf = { };
     local fx = nil;
+    local at_saved = nil;
 
     local function flush()
         if (#buf > 0) then
@@ -120,11 +121,17 @@ cleaner.parse = function (raw)
             -- Prompt / control markers..
             i = j + 2;
         elseif (b == 0xEF and c ~= nil and c >= 0x1F and c <= 0x2E) then
-            -- Auto-translate brackets and element icons..
+            -- Auto-translate brackets (the phrase gets its own span, see palette
+            -- 'autotrans') and element icons..
             if (c == 0x27) then
+                flush();
+                at_saved = fx;
+                fx = 'autotrans';
                 buf[#buf + 1] = '{';
             elseif (c == 0x28) then
                 buf[#buf + 1] = '}';
+                flush();
+                fx = at_saved;
             end
             i = j + 2;
         elseif (is_sjis_lead(b) and c ~= nil) then
