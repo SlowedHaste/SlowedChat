@@ -101,14 +101,26 @@ render.lines = function (lines, s, on_copy)
     local function u32(key, base)
         -- Inline FFXI colors fall back to the line color when unknown or disabled..
         local k = key;
-        if (k == 'base' or (k:sub(1, 2) == 'fx' and (not s.inline_colors or palette.ffxi[k] == nil))) then
+        if (k == 'base' or (k:sub(1, 2) == 'fx' and (not s.inline_colors or palette.ffxi[k] == nil))
+            or (k == 'speaker' and not s.speaker_names)) then
             k = base;
         end
-        local c = colors[k];
+
+        -- Speaker names are the line color, lifted toward white..
+        local ck = (k == 'speaker') and ('speaker|' .. base) or k;
+        local c = colors[ck];
         if (c == nil) then
-            local rgba = palette.get(k, s.colors) or { 1, 1, 1, 1 };
+            local rgba = palette.get(k == 'speaker' and base or k, s.colors) or { 1, 1, 1, 1 };
+            if (k == 'speaker') then
+                rgba = {
+                    rgba[1] + (1 - rgba[1]) * 0.45,
+                    rgba[2] + (1 - rgba[2]) * 0.45,
+                    rgba[3] + (1 - rgba[3]) * 0.45,
+                    rgba[4],
+                };
+            end
             c = imgui.GetColorU32(rgba);
-            colors[k] = c;
+            colors[ck] = c;
         end
         return c;
     end

@@ -1,6 +1,6 @@
 addon.name      = 'slowedchat';
 addon.author    = 'panda';
-addon.version   = '0.2';
+addon.version   = '0.3';
 addon.desc      = 'WoW-style tabbed chat windows.';
 addon.link      = '';
 
@@ -25,11 +25,15 @@ local default_settings = T{
     custom_input    = true,         -- Enter / '/' opens slowedchat's input instead of the game's.
     chat_channel    = 'say',        -- Last sticky input channel.
     tell_target     = '',           -- Last tell target, when chat_channel is 'tell'.
-    chat_menus      = T{ },         -- Game menus where Enter opens chat. (Learned automatically.)    timestamps      = true,
+    chat_menus      = T{ },         -- Game menus where Enter opens chat. (Learned automatically.)
+    timestamps      = true,
     timestamp_fmt   = '[%H:%M]',
     max_lines       = 300,          -- Lines kept per tab.
     font_scale      = 1.0,
-    bg_alpha        = 0.60,
+    bg_alpha        = 0.60,         -- Background opacity while hovered / typing.
+    hover_reveal    = true,         -- Dim the background and chrome while the mouse is elsewhere.
+    idle_bg_alpha   = 0.20,         -- Background opacity while idle. (With hover_reveal.)
+    speaker_names   = true,         -- Draw speaker names a shade brighter than the message.
     line_gap        = 2,            -- Extra pixels between lines.
     wrap_indent     = 12,           -- Indent for wrapped continuation rows.
     text_shadow     = true,
@@ -86,29 +90,42 @@ local layouts = {
 -- Styles whose numbers are highlighted.
 local NUMBER_STYLES = cats('combat', 'dealt', 'taken', 'heal', 'crit', 'skillchain', 'xp', 'gil');
 
--- Window theme. (Dark, low-contrast chrome so the text stands out.)
-local theme_colors = {
-    { ImGuiCol_WindowBg,                 { 0.02, 0.02, 0.03, 1.00 } },
-    { ImGuiCol_Border,                   { 1.00, 1.00, 1.00, 0.07 } },
-    { ImGuiCol_Tab,                      { 0.10, 0.10, 0.12, 0.80 } },
-    { ImGuiCol_TabHovered,               { 0.30, 0.30, 0.36, 1.00 } },
-    { ImGuiCol_TabSelected,              { 0.20, 0.20, 0.25, 1.00 } },
-    { ImGuiCol_TabSelectedOverline,      { 1.00, 0.82, 0.00, 1.00 } },
-    { ImGuiCol_TabDimmed,                { 0.10, 0.10, 0.12, 0.80 } },
-    { ImGuiCol_TabDimmedSelected,        { 0.20, 0.20, 0.25, 1.00 } },
-    { ImGuiCol_TabDimmedSelectedOverline,{ 1.00, 0.82, 0.00, 0.60 } },
-    { ImGuiCol_ScrollbarBg,              { 0.00, 0.00, 0.00, 0.00 } },
-    { ImGuiCol_ScrollbarGrab,            { 1.00, 1.00, 1.00, 0.15 } },
-    { ImGuiCol_ScrollbarGrabHovered,     { 1.00, 1.00, 1.00, 0.30 } },
-    { ImGuiCol_ResizeGrip,               { 1.00, 1.00, 1.00, 0.05 } },
-};
+-- Window theme. Dark, low-contrast chrome so the text stands out. Chrome that
+-- only matters while interacting (border, scrollbar, resize grip) fades in with
+-- 'reveal' (0 = idle, 1 = hovered / typing).
+local ACCENT = { 1.00, 0.82, 0.00 };
+
+local function theme_colors(reveal)
+    return {
+        { ImGuiCol_WindowBg,             { 0.03, 0.03, 0.045, 1.00 } },
+        { ImGuiCol_Border,               { 1.00, 1.00, 1.00, 0.09 * reveal } },
+        { ImGuiCol_ScrollbarBg,          { 0.00, 0.00, 0.00, 0.00 } },
+        { ImGuiCol_ScrollbarGrab,        { 1.00, 1.00, 1.00, 0.20 * reveal } },
+        { ImGuiCol_ScrollbarGrabHovered, { 1.00, 1.00, 1.00, 0.35 } },
+        { ImGuiCol_ScrollbarGrabActive,  { ACCENT[1], ACCENT[2], ACCENT[3], 0.60 } },
+        { ImGuiCol_ResizeGrip,           { 1.00, 1.00, 1.00, 0.10 * reveal } },
+        { ImGuiCol_ResizeGripHovered,    { ACCENT[1], ACCENT[2], ACCENT[3], 0.50 } },
+        { ImGuiCol_ResizeGripActive,     { ACCENT[1], ACCENT[2], ACCENT[3], 0.80 } },
+    };
+end
 local theme_vars = {
-    { ImGuiStyleVar_WindowRounding,  4.0 },
-    { ImGuiStyleVar_WindowPadding,   { 6, 4 } },
-    { ImGuiStyleVar_ScrollbarSize,   6.0 },
-    { ImGuiStyleVar_TabRounding,     3.0 },
-    { ImGuiStyleVar_FramePadding,    { 8, 3 } },
-    { ImGuiStyleVar_TabBarBorderSize, 0.0 },
+    { ImGuiStyleVar_WindowRounding,   6.0 },
+    { ImGuiStyleVar_WindowPadding,    { 8, 6 } },
+    { ImGuiStyleVar_WindowBorderSize, 1.0 },
+    { ImGuiStyleVar_ScrollbarSize,    5.0 },
+    { ImGuiStyleVar_FramePadding,     { 8, 3 } },
+};
+
+-- Speaker prefixes per category, highlighted as the 'speaker' style.
+local SPEAKERS = {
+    say        = { '^[^%s:]+ : ' },
+    shout      = { '^[^%s:]+ : ' },
+    yell       = { '^[^%s%[]+%[[^%]]*%]: ', '^[^%s:]+ : ' },
+    party      = { '^%([^%)]+%) ' },
+    linkshell  = { '^<[^>]+> ' },
+    linkshell2 = { '^%[2%]<[^>]+> ', '^<[^>]+> ' },
+    unity      = { '^{[^}]+} ' },
+    tell       = { '^[^%s>]+>> ', '^>>[^%s:]+ : ' },
 };
 
 -- Addon State
@@ -151,9 +168,22 @@ end
 --[[
 * Converts parsed spans into render spans, splitting out numbers when the style highlights them.
 --]]
-local function build_spans(parsed, style)
+local function build_spans(parsed, style, cat)
     local out = { };
     local numbers = NUMBER_STYLES[style];
+
+    -- Split the speaker prefix ("(Name) ", "<Name> ", "Name>> " ...) into its own span..
+    local first = parsed[1];
+    if (first ~= nil and first.fx == nil and SPEAKERS[cat] ~= nil) then
+        for _, pattern in ipairs(SPEAKERS[cat]) do
+            local _, b = first.text:find(pattern);
+            if (b ~= nil) then
+                out[#out + 1] = { text = first.text:sub(1, b), key = 'speaker' };
+                parsed = { { text = first.text:sub(b + 1), fx = nil }, unpack(parsed, 2) };
+                break;
+            end
+        end
+    end
 
     for _, sp in ipairs(parsed) do
         local key = sp.fx or 'base';
@@ -219,6 +249,10 @@ local function push_line(e)
                 table.insert(tab.lines, e);
                 if (#tab.lines > state.settings.max_lines) then
                     table.remove(tab.lines, 1);
+                end
+                -- Counted for the "N new" jump button while scrolled up..
+                if (tab.scrolled_up) then
+                    tab.new_below = (tab.new_below or 0) + 1;
                 end
                 -- Only tabs that opt in (Messages) get the unread marker; the busy
                 -- ones would always be lit..
@@ -454,7 +488,7 @@ ashita.events.register('text_in', 'text_in_cb', function (e)
             cat   = cat,
             style = style,
             text  = text,
-            spans = build_spans(parsed, style),
+            spans = build_spans(parsed, style, cat),
         });
     end);
 
@@ -489,6 +523,44 @@ end);
 --[[
 * Renders the lines of a tab inside a scrolling child region.
 --]]
+local function u32(r, g, b, a)
+    return imgui.GetColorU32({ r, g, b, a });
+end
+
+--[[
+* Draws the "jump to latest" pill at the bottom-right of the lines area.
+* Returns true when clicked.
+--]]
+local function jump_button(tab)
+    local dl = imgui.GetWindowDrawList();
+    local font, fs = imgui.GetFont(), imgui.GetFontSize();
+    local lh = imgui.GetTextLineHeight();
+    local wx, wy = imgui.GetWindowPos();
+    local ww, wh = imgui.GetWindowSize();
+
+    local n = tab.new_below or 0;
+    local label = (n > 0) and ('%d new'):fmt(n) or 'Latest';
+    local tw = imgui.CalcTextSize(label);
+    local pw, ph = tw + 30, lh + 8;
+    local px, py = wx + ww - pw - 12, wy + wh - ph - 6;
+
+    imgui.SetCursorScreenPos({ px, py });
+    local clicked = imgui.InvisibleButton('##jump', { pw, ph });
+    local hovered = imgui.IsItemHovered();
+
+    local border = (n > 0) and u32(ACCENT[1], ACCENT[2], ACCENT[3], 0.85) or u32(1, 1, 1, 0.25);
+    dl:AddRectFilled({ px, py }, { px + pw, py + ph }, hovered and u32(0.18, 0.18, 0.22, 0.95) or u32(0.08, 0.08, 0.10, 0.92), ph * 0.5);
+    dl:AddRect({ px, py }, { px + pw, py + ph }, border, ph * 0.5, ImDrawFlags_None, 1.0);
+
+    -- Down arrow..
+    local cx, cy = px + 13, py + ph * 0.5;
+    local arrow = (n > 0) and u32(ACCENT[1], ACCENT[2], ACCENT[3], 1.0) or u32(0.85, 0.85, 0.85, 1.0);
+    dl:AddTriangleFilled({ cx - 4, cy - 2 }, { cx + 4, cy - 2 }, { cx, cy + 3 }, arrow);
+    dl:AddText(font, fs, { px + 22, py + 4 }, u32(0.92, 0.92, 0.92, 1.0), label);
+
+    return clicked;
+end
+
 local function render_lines(tab, footer)
     imgui.BeginChild('##lines', { 0, -footer }, ImGuiChildFlags_None, ImGuiWindowFlags_None);
 
@@ -502,9 +574,112 @@ local function render_lines(tab, footer)
     if (at_bottom or tab.scroll) then
         imgui.SetScrollHereY(1.0);
         tab.scroll = false;
+        tab.scrolled_up = false;
+        tab.new_below = 0;
+    else
+        tab.scrolled_up = true;
+        if (jump_button(tab)) then
+            tab.scroll = true;
+        end
     end
 
     imgui.EndChild();
+end
+
+--[[
+* Selects a tab in a window.
+--]]
+local function select_tab(win, ws, i)
+    local tab = win.tabs[i];
+    if (tab == nil) then
+        return;
+    end
+    win.active = i;
+    tab.scroll = true;
+    tab.unread = false;
+    if (ws.tab ~= tab.name) then
+        ws.tab = tab.name;
+        state.pending_save = true;
+    end
+end
+
+--[[
+* Draws the tab strip: flat text tabs with an accent underline on the selected
+* one, a pulsing dot on tabs with unread messages, and a settings button.
+--]]
+local function render_tabs(win, ws, reveal)
+    local s = state.settings;
+    local dl = imgui.GetWindowDrawList();
+    local font, fs = imgui.GetFont(), imgui.GetFontSize();
+    local lh = imgui.GetTextLineHeight();
+    local fh = imgui.GetFrameHeight();
+    local x0, y0 = imgui.GetCursorScreenPos();
+    local avail = imgui.GetContentRegionAvail();
+    local pad = 9;
+
+    if (win.active == nil) then
+        select_tab(win, ws, win.select or 1);
+        win.select = nil;
+    end
+
+    local dim = 0.55 + 0.35 * reveal;
+    local dot = palette.get('tell', s.colors) or { 1, 0.5, 1, 1 };
+    local pulse = 0.55 + 0.45 * math.sin(os.clock() * 5.0);
+
+    local x = x0;
+    for i, tab in ipairs(win.tabs) do
+        local tw = imgui.CalcTextSize(tab.name);
+        local w = tw + pad * 2 + (tab.unread and 9 or 0);
+
+        imgui.SetCursorScreenPos({ x, y0 });
+        if (imgui.InvisibleButton(('##tab_%s_%d'):fmt(win.id, i), { w, fh })) then
+            select_tab(win, ws, i);
+        end
+        local hovered = imgui.IsItemHovered();
+        local selected = (win.active == i);
+
+        if (selected) then
+            dl:AddRectFilled({ x, y0 }, { x + w, y0 + fh }, u32(1, 1, 1, 0.07), 4.0, ImDrawFlags_RoundCornersTop);
+            dl:AddRectFilled({ x + 5, y0 + fh - 2 }, { x + w - 5, y0 + fh }, u32(ACCENT[1], ACCENT[2], ACCENT[3], 1.0), 1.0);
+        elseif (hovered) then
+            dl:AddRectFilled({ x, y0 }, { x + w, y0 + fh }, u32(1, 1, 1, 0.04), 4.0, ImDrawFlags_RoundCornersTop);
+        end
+
+        local tc;
+        if (selected) then
+            tc = u32(1.0, 1.0, 1.0, 1.0);
+        elseif (hovered) then
+            tc = u32(0.90, 0.90, 0.92, 1.0);
+        else
+            tc = u32(0.62, 0.62, 0.66, dim);
+        end
+        local ty = y0 + (fh - lh) * 0.5;
+        dl:AddText(font, fs, { x + pad + 1, ty + 1 }, u32(0, 0, 0, 0.7 * dim), tab.name);
+        dl:AddText(font, fs, { x + pad, ty }, tc, tab.name);
+
+        if (tab.unread) then
+            dl:AddCircleFilled({ x + pad + tw + 7, y0 + fh * 0.5 }, 3.0, u32(dot[1], dot[2], dot[3], pulse), 12);
+        end
+
+        x = x + w + 2;
+    end
+
+    -- Settings button (three bars) at the right..
+    local bx = x0 + avail - fh;
+    imgui.SetCursorScreenPos({ bx, y0 });
+    if (imgui.InvisibleButton(('##cfg_%s'):fmt(win.id), { fh, fh })) then
+        state.config_open[1] = not state.config_open[1];
+    end
+    local bc = imgui.IsItemHovered() and u32(1, 1, 1, 0.95) or u32(0.62, 0.62, 0.66, 0.9 * reveal);
+    local cx, cy = bx + fh * 0.5, y0 + fh * 0.5;
+    for k = -1, 1 do
+        dl:AddRectFilled({ cx - 5, cy + k * 4 - 0.5 }, { cx + 5, cy + k * 4 + 1 }, bc, 0.5);
+    end
+
+    -- Hairline under the strip..
+    dl:AddLine({ x0, y0 + fh + 0.5 }, { x0 + avail, y0 + fh + 0.5 }, u32(1, 1, 1, 0.06 + 0.06 * reveal), 1.0);
+
+    imgui.SetCursorScreenPos({ x0, y0 + fh + 4 });
 end
 
 --[[
@@ -538,10 +713,19 @@ local function render_window(win)
         return;
     end
 
+    -- Ease toward revealed (hovered / typing / settings open) or idle..
+    local target = 1.0;
+    if (s.hover_reveal and not win.hovered and not (win.id == 'main' and input.active) and not state.config_open[1]) then
+        target = 0.0;
+    end
+    local dt = imgui.GetIO().DeltaTime or 0.016;
+    win.reveal = (win.reveal or 1.0) + (target - (win.reveal or 1.0)) * math.min(1.0, dt * 10.0);
+    local reveal = win.reveal;
+
     local cond = state.reset_pos and ImGuiCond_Always or ImGuiCond_FirstUseEver;
     imgui.SetNextWindowPos({ ws.x, ws.y }, cond);
     imgui.SetNextWindowSize({ ws.w, ws.h }, cond);
-    imgui.SetNextWindowBgAlpha(s.bg_alpha);
+    imgui.SetNextWindowBgAlpha(s.idle_bg_alpha + (s.bg_alpha - s.idle_bg_alpha) * (s.hover_reveal and reveal or 1.0));
 
     local flags = bit.bor(ImGuiWindowFlags_NoTitleBar, ImGuiWindowFlags_NoCollapse, ImGuiWindowFlags_NoScrollbar,
         ImGuiWindowFlags_NoSavedSettings, ImGuiWindowFlags_NoFocusOnAppearing, ImGuiWindowFlags_NoBringToFrontOnFocus);
@@ -554,7 +738,8 @@ local function render_window(win)
         flags = bit.bor(flags, ImGuiWindowFlags_NoInputs);
     end
 
-    for _, c in ipairs(theme_colors) do
+    local colors = theme_colors(reveal);
+    for _, c in ipairs(colors) do
         imgui.PushStyleColor(c[1], c[2]);
     end
     for _, v in ipairs(theme_vars) do
@@ -574,47 +759,20 @@ local function render_window(win)
             state.pending_save = true;
         end
 
+        -- Hover state drives the reveal fade next frame..
+        win.hovered = imgui.IsWindowHovered(bit.bor(ImGuiHoveredFlags_RootAndChildWindows, ImGuiHoveredFlags_AllowWhenBlockedByActiveItem));
+
         local pushed = false;
         if (s.font_scale ~= 1.0) then
             pushed = pcall(imgui.PushFont, imgui.GetFont(), imgui.GetFontSize() * s.font_scale);
         end
 
-        local tbflags = bit.bor(ImGuiTabBarFlags_NoTooltip, ImGuiTabBarFlags_DrawSelectedOverline);
-        if (imgui.BeginTabBar('##tabs_' .. win.id, tbflags)) then
-            for i, tab in ipairs(win.tabs) do
-                local tflags = ImGuiTabItemFlags_None;
-                if (win.select == i) then
-                    tflags = ImGuiTabItemFlags_SetSelected;
-                    win.select = nil;
-                end
+        render_tabs(win, ws, reveal);
 
-                -- Highlight tabs with unread lines..
-                local unread = tab.unread;
-                local label = tab.name;
-                if (unread) then
-                    imgui.PushStyleColor(ImGuiCol_Text, { 1.0, 0.82, 0.0, 1.0 });
-                    label = label .. ' *';
-                else
-                    imgui.PushStyleColor(ImGuiCol_Text, { 0.85, 0.85, 0.85, 1.0 });
-                end
-                local open = imgui.BeginTabItem(('%s###tab%d'):fmt(label, i), nil, tflags);
-                imgui.PopStyleColor();
-
-                if (open) then
-                    if (win.active ~= i) then
-                        win.active = i;
-                        tab.scroll = true;
-                        if (ws.tab ~= tab.name) then
-                            ws.tab = tab.name;
-                            state.pending_save = true;
-                        end
-                    end
-                    tab.unread = false;
-                    render_lines(tab, win.id == 'main' and input.height() or 0);
-                    imgui.EndTabItem();
-                end
-            end
-            imgui.EndTabBar();
+        local tab = win.tabs[win.active];
+        if (tab ~= nil) then
+            tab.unread = false;
+            render_lines(tab, win.id == 'main' and input.height() or 0);
         end
 
         if (win.id == 'main') then
@@ -628,7 +786,7 @@ local function render_window(win)
     imgui.End();
 
     imgui.PopStyleVar(#theme_vars + 1);
-    imgui.PopStyleColor(#theme_colors);
+    imgui.PopStyleColor(#colors);
 end
 
 --[[
@@ -680,82 +838,110 @@ local function render_config()
         end
     end
 
-    if (imgui.Begin('slowedchat Settings', state.config_open, ImGuiWindowFlags_AlwaysAutoResize)) then
-        imgui.Text('Layout');
-        if (imgui.RadioButton('Single window (All / Combat / Messages / System)', s.layout == 'single')) then
-            s.layout = 'single';
-            build_windows();
+    local function slider(label, key, lo, hi, fmt, int)
+        local v = { s[key] };
+        local moved;
+        if (int) then
+            moved = imgui.SliderInt(label, v, lo, hi);
+        else
+            moved = imgui.SliderFloat(label, v, lo, hi, fmt);
+        end
+        if (moved) then
+            s[key] = v[1];
             changed = true;
         end
-        if (imgui.RadioButton('Split: Chat window + Log window', s.layout == 'dual')) then
-            s.layout = 'dual';
-            build_windows();
-            changed = true;
-        end
+    end
 
-        imgui.Separator();
-        checkbox('Hide lines from the game\'s chat log', 'hide_native');
-        if (s.hide_native) then
-            imgui.Indent();
-            checkbox('Also hide NPC dialog (may confuse some NPCs)', 'hide_npc');
-            imgui.Unindent();
-        end
-        checkbox('Hide the game\'s chat windows', 'hide_window');
+    local function hint(text)
         imgui.SameLine();
-        imgui.TextDisabled(('(%s)'):fmt(nativechat.status));
-        checkbox('Type in slowedchat (Enter / \'/\' opens its input bar)', 'custom_input');
-        checkbox('Show timestamps', 'timestamps');
-        checkbox('Text shadow', 'text_shadow');
-        checkbox('Use game colors for items / key items', 'inline_colors');
-        checkbox('Lock windows', 'locked');
+        imgui.TextDisabled(text);
+    end
 
-        imgui.Text('While the player menu is open:');
-        for _, m in ipairs({ { 'fade', 'Fade' }, { 'hide', 'Hide' }, { 'off', 'Stay visible' } }) do
-            imgui.SameLine();
-            if (imgui.RadioButton(m[2] .. '##menu_mode', s.menu_mode == m[1])) then
-                s.menu_mode = m[1];
+    imgui.SetNextWindowSizeConstraints({ 420, 0 }, { 700, 900 });
+    imgui.PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0);
+    imgui.PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0);
+    imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, { 12, 10 });
+    imgui.PushStyleColor(ImGuiCol_WindowBg, { 0.05, 0.05, 0.07, 0.96 });
+    imgui.PushStyleColor(ImGuiCol_Header, { 1.0, 1.0, 1.0, 0.06 });
+    imgui.PushStyleColor(ImGuiCol_HeaderHovered, { 1.0, 1.0, 1.0, 0.10 });
+    imgui.PushStyleColor(ImGuiCol_CheckMark, { ACCENT[1], ACCENT[2], ACCENT[3], 1.0 });
+    imgui.PushStyleColor(ImGuiCol_SliderGrab, { ACCENT[1], ACCENT[2], ACCENT[3], 0.80 });
+
+    if (imgui.Begin('slowedchat##settings', state.config_open, ImGuiWindowFlags_AlwaysAutoResize)) then
+        local open = ImGuiTreeNodeFlags_DefaultOpen;
+
+        if (imgui.CollapsingHeader('Layout', open)) then
+            if (imgui.RadioButton('One window  (All / Combat / Messages / System)', s.layout == 'single')) then
+                s.layout = 'single';
+                build_windows();
                 changed = true;
             end
-        end
-        if (s.menu_mode == 'fade') then
-            local fa = { s.menu_alpha };
-            if (imgui.SliderFloat('Faded opacity', fa, 0.0, 0.8, '%.2f')) then
-                s.menu_alpha = fa[1];
+            if (imgui.RadioButton('Split  (Chat window + Log window)', s.layout == 'dual')) then
+                s.layout = 'dual';
+                build_windows();
                 changed = true;
             end
-        end
-        checkbox('Show chat mode ids (debug)', 'show_mode_ids');
-
-        imgui.Separator();
-        local alpha = { s.bg_alpha };
-        if (imgui.SliderFloat('Background opacity', alpha, 0.0, 1.0, '%.2f')) then
-            s.bg_alpha = alpha[1];
-            changed = true;
-        end
-        local scale = { s.font_scale };
-        if (imgui.SliderFloat('Font scale', scale, 0.5, 2.0, '%.2f')) then
-            s.font_scale = scale[1];
-            changed = true;
-        end
-        local gap = { s.line_gap };
-        if (imgui.SliderInt('Line spacing', gap, 0, 10)) then
-            s.line_gap = gap[1];
-            changed = true;
-        end
-        local lines = { s.max_lines };
-        if (imgui.SliderInt('Lines per tab', lines, 50, 1000)) then
-            s.max_lines = lines[1];
-            changed = true;
+            checkbox('Lock windows', 'locked');
+            imgui.Spacing();
         end
 
-        imgui.Separator();
+        if (imgui.CollapsingHeader('Appearance', open)) then
+            checkbox('Show the background only on hover', 'hover_reveal');
+            slider('Background opacity', 'bg_alpha', 0.0, 1.0, '%.2f');
+            if (s.hover_reveal) then
+                slider('Idle background opacity', 'idle_bg_alpha', 0.0, 1.0, '%.2f');
+            end
+            slider('Font scale', 'font_scale', 0.5, 2.0, '%.2f');
+            slider('Line spacing', 'line_gap', 0, 10, nil, true);
+            checkbox('Show timestamps', 'timestamps');
+            checkbox('Highlight speaker names', 'speaker_names');
+            checkbox('Text shadow', 'text_shadow');
+            checkbox('Use game colors for items / key items', 'inline_colors');
+            imgui.Spacing();
+        end
+
+        if (imgui.CollapsingHeader('Behavior', open)) then
+            checkbox('Type in slowedchat  (Enter / \'/\' opens its input bar)', 'custom_input');
+            imgui.Text('While the player menu is open:');
+            for _, m in ipairs({ { 'fade', 'Fade' }, { 'hide', 'Hide' }, { 'off', 'Stay visible' } }) do
+                imgui.SameLine();
+                if (imgui.RadioButton(m[2] .. '##menu_mode', s.menu_mode == m[1])) then
+                    s.menu_mode = m[1];
+                    changed = true;
+                end
+            end
+            if (s.menu_mode == 'fade') then
+                slider('Faded opacity', 'menu_alpha', 0.0, 0.8, '%.2f');
+            end
+            slider('Lines kept per tab', 'max_lines', 50, 1000, nil, true);
+            imgui.Spacing();
+        end
+
+        if (imgui.CollapsingHeader('Game chat', open)) then
+            checkbox('Hide the game\'s chat windows', 'hide_window');
+            hint(('(%s)'):fmt(nativechat.status));
+            checkbox('Hide lines from the game\'s chat log', 'hide_native');
+            if (s.hide_native) then
+                imgui.Indent();
+                checkbox('Also hide NPC dialog  (may confuse some NPCs)', 'hide_npc');
+                imgui.Unindent();
+            end
+            imgui.Spacing();
+        end
+
         if (imgui.CollapsingHeader('Colors')) then
             if (render_color_config(s)) then
                 changed = true;
             end
+            imgui.Spacing();
         end
 
-        imgui.Separator();
+        if (imgui.CollapsingHeader('Advanced')) then
+            checkbox('Show chat mode ids on each line  (for /schat map)', 'show_mode_ids');
+            imgui.Spacing();
+        end
+
+        imgui.Spacing();
         if (imgui.Button('Clear all tabs')) then
             clear_all();
         end
@@ -768,6 +954,9 @@ local function render_config()
         end
     end
     imgui.End();
+
+    imgui.PopStyleColor(5);
+    imgui.PopStyleVar(3);
 
     if (changed) then
         render.version = render.version + 1;

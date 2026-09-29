@@ -394,12 +394,26 @@ input.render = function (s)
     end
     local color = palette.get(key, s.colors) or { 1, 1, 1, 1 };
 
-    imgui.AlignTextToFramePadding();
-    imgui.TextColored(color, label);
-    imgui.SameLine();
+    -- Channel pill..
+    label = label:gsub(':$', '');
+    local dl = imgui.GetWindowDrawList();
+    local fh = imgui.GetFrameHeight();
+    local lh = imgui.GetTextLineHeight();
+    local px, py = imgui.GetCursorScreenPos();
+    local pw = imgui.CalcTextSize(label) + 16;
+    dl:AddRectFilled({ px, py }, { px + pw, py + fh }, imgui.GetColorU32({ color[1], color[2], color[3], 0.16 }), 4.0);
+    dl:AddRect({ px, py }, { px + pw, py + fh }, imgui.GetColorU32({ color[1], color[2], color[3], 0.45 }), 4.0, ImDrawFlags_None, 1.0);
+    dl:AddText(imgui.GetFont(), imgui.GetFontSize(), { px + 8, py + (fh - lh) * 0.5 }, imgui.GetColorU32(color), label);
+    imgui.Dummy({ pw, fh });
+    imgui.SameLine(0, 6);
 
     imgui.PushItemWidth(-1);
+    imgui.PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0);
+    imgui.PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0);
     imgui.PushStyleColor(ImGuiCol_Text, color);
+    imgui.PushStyleColor(ImGuiCol_Border, { color[1], color[2], color[3], 0.35 });
+    imgui.PushStyleColor(ImGuiCol_FrameBgHovered, { 0.0, 0.0, 0.0, 0.55 });
+    imgui.PushStyleColor(ImGuiCol_FrameBgActive, { 0.0, 0.0, 0.0, 0.55 });
     imgui.PushStyleColor(ImGuiCol_FrameBg, { 0.0, 0.0, 0.0, 0.55 });
     if (input.focus) then
         imgui.SetKeyboardFocusHere();
@@ -410,7 +424,8 @@ input.render = function (s)
     local is_active = imgui.IsItemActive();
     local deactivated = imgui.IsItemDeactivated();
 
-    imgui.PopStyleColor(2);
+    imgui.PopStyleColor(5);
+    imgui.PopStyleVar(2);
     imgui.PopItemWidth();
 
     if (is_active) then
