@@ -25,8 +25,7 @@ local default_settings = T{
     custom_input    = true,         -- Enter / '/' opens slowedchat's input instead of the game's.
     chat_channel    = 'say',        -- Last sticky input channel.
     tell_target     = '',           -- Last tell target, when chat_channel is 'tell'.
-    chat_menus      = T{ },         -- Game menus where Enter opens chat. (Learned automatically.)
-    timestamps      = true,
+    chat_menus      = T{ },         -- Game menus where Enter opens chat. (Learned automatically.)    timestamps      = true,
     timestamp_fmt   = '[%H:%M]',
     max_lines       = 300,          -- Lines kept per tab.
     font_scale      = 1.0,
@@ -246,6 +245,10 @@ settings.register('settings', 'settings_update', function (s)
     render.version = render.version + 1;
     build_windows();
     input.restore(state.settings);
+    -- Move the windows to this character's saved position/size. (ImGui only
+    -- applies FirstUseEver once, so existing windows would otherwise stay put
+    -- and overwrite this character's saved layout.)
+    state.reset_pos = true;
     settings.save();
 end);
 
@@ -360,8 +363,7 @@ ashita.events.register('command', 'command_cb', function (e)
         for k, _ in pairs(s.chat_menus or { }) do
             learned:append(('"%s"'):fmt(k));
         end
-        line('Learned chat menus', #learned > 0 and learned:concat(', ') or 'none');
-        line('Game input state', tostring(AshitaCore:GetChatManager():IsInputOpen()));
+        line('Learned chat menus', #learned > 0 and learned:concat(', ') or 'none');        line('Game input state', tostring(AshitaCore:GetChatManager():IsInputOpen()));
         line('Last capture error', state.last_error or 'none');
         if (s.hide_native) then
             print(chat.header(addon.name):append(chat.warning('TEST LINE: if you can read this in the game\'s own chat log, hiding is not working.')));
@@ -475,7 +477,7 @@ ashita.events.register('key_data', 'key_data_cb', function (e)
 end);
 
 ashita.events.register('key_state', 'key_state_cb', function (e)
-    input.on_key_state(e);
+    input.on_key_state(e, state.settings);
 end);
 
 --[[
@@ -529,8 +531,15 @@ local function render_window(win)
 
     if (imgui.Begin(('%s##slowedchat_%s'):fmt(win.title, win.id), win.open, flags)) then
         -- Remember position/size so they survive reloads..
-        ws.x, ws.y = imgui.GetWindowPos();
-        ws.w, ws.h = imgui.GetWindowSize();
+        -- Remember position/size (whole pixels) and save when they change..
+        local x, y = imgui.GetWindowPos();
+        local w, h = imgui.GetWindowSize();
+        x, y = math.floor(x + 0.5), math.floor(y + 0.5);
+        w, h = math.floor(w + 0.5), math.floor(h + 0.5);
+        if (x ~= ws.x or y ~= ws.y or w ~= ws.w or h ~= ws.h) then
+            ws.x, ws.y, ws.w, ws.h = x, y, w, h;
+            state.pending_save = true;
+        end
 
         local pushed = false;
         if (s.font_scale ~= 1.0) then
@@ -562,7 +571,10 @@ local function render_window(win)
                     if (win.active ~= i) then
                         win.active = i;
                         tab.scroll = true;
-                        ws.tab = tab.name;
+                        if (ws.tab ~= tab.name) then
+                            ws.tab = tab.name;
+                            state.pending_save = true;
+                        end
                     end
                     tab.unread = false;
                     render_lines(tab, win.id == 'main' and input.height() or 0);
@@ -712,12 +724,6 @@ local function render_config()
         render.version = render.version + 1;
         state.pending_save = true;
     end
-
-    -- Save once the mouse is released instead of every frame while dragging..
-    if (state.pending_save and not imgui.IsMouseDown(0)) then
-        state.pending_save = false;
-        settings.save();
-    end
 end
 
 --[[
@@ -741,4 +747,15 @@ ashita.events.register('d3d_present', 'present_cb', function ()
     end
     state.reset_pos = false;
     render_config();
+
+    -- Save any change (window moves/resizes, tabs, channel, settings) once the
+    -- mouse is released, so nothing is lost if the game closes without unloading..
+    if (input.dirty) then
+        input.dirty = false;
+        state.pending_save = true;
+    end
+    if (state.pending_save and not imgui.IsMouseDown(0)) then
+        state.pending_save = false;
+        settings.save();
+    end
 end);

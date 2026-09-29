@@ -25,7 +25,8 @@ local input = {
     channel     = 'say',
     tell_target = nil,
     reply_to    = nil,      -- Last player who sent us a tell.
-    swallow     = false,    -- Hide Enter from the game until it is released.
+    held        = { },      -- [DIK] = true: hidden from the game until released.
+    held_at     = 0,
     takeover    = nil,      -- In-progress replacement of the game's chat line.
     tried       = false,    -- Takeover already attempted for the current game input.
     inject_esc  = 0,        -- Frames left to hold Escape down for the game.
@@ -66,6 +67,7 @@ local DIK_RETURN    = 0x1C;
 local DIK_NUMPADENT = 0x9C;
 local DIK_SLASH     = 0x35;
 local DIK_ESCAPE    = 0x01;
+local VK_CHAR_SLASH = 0x2F; -- '/' as a WM_CHAR character code.
 
 --[[
 * Game menu detection. (Signature from XIUI's core/gamestate.lua, thanks to Velyn.)
@@ -111,7 +113,30 @@ local function event_active()
 end
 
 --[[
-* Returns true if Enter / '/' should open our input instead of going to the game.
+* Returns true if another addon's ImGui text box is being typed in. (ImGui still
+* reports our own box for a frame after it closes, so that is ignored briefly.)
+--]]
+local function other_text_input()
+    if (input.active) then
+        return false;
+    end
+    local just_closed = input.closed_at ~= nil and (os.clock() - input.closed_at) < 0.3;
+    return imgui.GetIO().WantTextInput and not just_closed;
+end
+
+--[[
+* Returns true while slowedchat owns the '/' key.
+*
+* '/' has no use in the game other than opening its chat line, so while the
+* game's own text input is closed it is always hidden from the game, at every
+* input layer, with no menu checks. (Conditional blocking lost races.)
+--]]
+local function owns_slash(s)
+    return s.custom_input and GetPlayerEntity() ~= nil and not game_input_state();
+end
+
+--[[
+* Returns true if Enter should open our input instead of going to the game.
 --]]
 local function can_open(s)
     if (not s.custom_input or input.active) then
@@ -123,7 +148,7 @@ local function can_open(s)
     if (game_input_state()) then
         return false;
     end
-    if (imgui.GetIO().WantTextInput) then
+    if (other_text_input()) then
         return false;
     end
     -- Leave Enter alone while a game menu or NPC event needs it. Menus the game
@@ -150,8 +175,32 @@ input.open = function (prefill)
     end
 end
 
+--[[
+* Hides a DirectInput key from the game until it is physically released, so a
+* key that just opened/closed our input isn't also seen by the game.
+--]]
+local function hold(...)
+    for _, dik in ipairs({ ... }) do
+        input.held[dik] = true;
+    end
+    input.held_at = os.clock();
+end
+
+--[[
+* Opens our input from the '/' key, prefilled with '/'. The '/' character
+* message that follows the key press is dropped in on_key.
+--]]
+local function open_slash()
+    if (input.active or input.takeover ~= nil) then
+        return;
+    end
+    input.open('/');
+    input.slash_opened_at = os.clock();
+end
+
 input.close = function (clear)
     input.active = false;
+    input.closed_at = os.clock();
     if (clear) then
         input.buf[1] = '';
     end
@@ -167,6 +216,7 @@ end
 * Sets the sticky channel and remembers it in the settings.
 --]]
 local function set_channel(s, ch, target)
+    input.dirty = input.dirty or s.chat_channel ~= ch or (target ~= nil and s.tell_target ~= target);
     input.channel = ch;
     s.chat_channel = ch;
     if (target ~= nil) then
@@ -371,10 +421,11 @@ input.render = function (s)
     if (entered) then
         local text = input.buf[1];
         input.close(true);
-        input.swallow = true;
+        hold(DIK_RETURN, DIK_NUMPADENT);
         submit(s, text);
     elseif (imgui.IsKeyPressed(ImGuiKey_Escape)) then
         input.close(true);
+        hold(DIK_ESCAPE);
     elseif (deactivated) then
         -- Clicked away: close but keep what was typed..
         input.close(false);
@@ -389,23 +440,39 @@ input.on_key = function (e, s)
     local down = bit.band(e.lparam, 0x80000000) == 0;
 
     if (vk == VK_RETURN) then
-        if (down and not input.active) then
+        if (not down) then
+            return;
+        end
+        if (not input.active) then
             input.last_enter_menu = input.menu_name();
             input.last_enter_time = os.clock();
         end
-        if (not down) then
-            input.swallow = false;
-            return;
-        end
-        if (input.swallow) then
+        if (input.takeover ~= nil) then
+            -- The game's line is being closed; don't let it send. Send from ours instead..
+            input.takeover.submit = true;
+            hold(DIK_RETURN, DIK_NUMPADENT);
+            e.blocked = true;
+        elseif (input.held[DIK_RETURN]) then
             e.blocked = true;
         elseif (can_open(s)) then
-            input.swallow = true;
+            hold(DIK_RETURN, DIK_NUMPADENT);
             input.open();
             e.blocked = true;
         end
-    elseif (vk == VK_OEM_2 and down and can_open(s)) then
-        input.open('/');
+    elseif (vk == VK_OEM_2) then
+        -- The key press never reaches the game. (Typed '/' characters come from a
+        -- separate character message, so typing '/' in our bar still works.)
+        if (other_text_input() or not owns_slash(s)) then
+            return;
+        end
+        e.blocked = true;
+        if (down and not input.active) then
+            open_slash();
+        end
+    elseif (vk == VK_CHAR_SLASH and input.slash_opened_at ~= nil and (os.clock() - input.slash_opened_at) < 0.25) then
+        -- The '/' character message that follows the key press; the game must not
+        -- see it either. (The input was already opened with a '/'.)
+        input.slash_opened_at = nil;
         e.blocked = true;
     end
 end
@@ -419,27 +486,23 @@ input.on_key_data = function (e, s)
     end
 
     if (e.key == DIK_RETURN or e.key == DIK_NUMPADENT) then
-        if (e.down and not input.swallow and can_open(s)) then
-            input.swallow = true;
+        if (e.down and input.takeover ~= nil) then
+            input.takeover.submit = true;
+            hold(DIK_RETURN, DIK_NUMPADENT);
+        elseif (e.down and not input.held[e.key] and can_open(s)) then
+            hold(DIK_RETURN, DIK_NUMPADENT);
             input.open();
         end
-        if (input.swallow or input.active) then
-            e.blocked = true;
-        end
-        if (not e.down) then
-            input.swallow = false;
-        end
-        return;
-    end
-
-    if (e.key == DIK_SLASH and e.down and can_open(s)) then
-        input.open('/');
+    elseif (e.key == DIK_SLASH and owns_slash(s)) then
         e.blocked = true;
+        if (e.down and not input.active and not other_text_input()) then
+            open_slash();
+        end
         return;
     end
 
-    -- Keep keys from reaching the game while typing..
-    if (input.active) then
+    -- Keep keys from reaching the game while typing, or until released..
+    if (input.active or input.held[e.key] or input.takeover ~= nil and (e.key == DIK_RETURN or e.key == DIK_NUMPADENT)) then
         e.blocked = true;
     end
 end
@@ -447,17 +510,29 @@ end
 --[[
 * event: key_state (DirectInput keyboard state)
 --]]
-input.on_key_state = function (e)
+input.on_key_state = function (e, s)
     if (e.data_raw == nil) then
         return;
     end
     local keys = ffi.cast('uint8_t*', e.data_raw);
 
+    -- The game never sees '/' while we own it. (See owns_slash)
+    if (owns_slash(s)) then
+        keys[DIK_SLASH] = 0;
+    end
+
+    -- Release held keys once DirectInput itself reports them up. (Windows'
+    -- key-up can arrive a frame earlier, and the game would see a fresh press.)
+    for dik, _ in pairs(input.held) do
+        if (bit.band(keys[dik], 0x80) == 0) then
+            input.held[dik] = nil;
+        else
+            keys[dik] = 0;
+        end
+    end
+
     if (input.active) then
         ffi.fill(keys, 256, 0);
-    elseif (input.swallow) then
-        keys[DIK_RETURN] = 0;
-        keys[DIK_NUMPADENT] = 0;
     end
 
     -- Press Escape for the game to close its chat line. (See input.update)
@@ -484,6 +559,12 @@ end
 input.update = function (s, on_learn)
     local open, is_chat = game_input_state();
 
+    -- Safety: never keep a key hidden from the game for long, even if the
+    -- DirectInput state event stops arriving..
+    if (next(input.held) ~= nil and os.clock() - input.held_at > 1.5) then
+        input.held = { };
+    end
+
     local t = input.takeover;
     if (t ~= nil) then
         t.frames = t.frames + 1;
@@ -498,7 +579,16 @@ input.update = function (s, on_learn)
         -- Wait two frames so our input doesn't also see the Escape we sent..
         if ((not open and t.frames >= 2) or t.frames >= 15) then
             input.takeover = nil;
-            if (not open) then
+            if (open) then
+                return;
+            end
+            if (t.keep_ours) then
+                -- Our bar was already open; just give it focus back..
+                input.focus = true;
+            elseif (t.submit and #t.text > 0) then
+                -- Enter was pressed while the game's line was closing: send it from here..
+                submit(s, t.text);
+            else
                 input.open(#t.text > 0 and t.text or nil);
             end
         end
@@ -514,7 +604,7 @@ input.update = function (s, on_learn)
     end
 
     -- Only try once per opening so a failed close can't loop..
-    if (not s.custom_input or input.active or input.tried or GetPlayerEntity() == nil) then
+    if (not s.custom_input or input.tried or GetPlayerEntity() == nil) then
         return;
     end
     input.tried = true;
@@ -532,7 +622,7 @@ input.update = function (s, on_learn)
         end
     end
 
-    input.takeover = { text = native_text(), frames = 0 };
+    input.takeover = { text = native_text(), frames = 0, keep_ours = input.active };
 
     local hwnd = AshitaCore:GetProperties():GetFinalFantasyHwnd();
     AshitaCore:SendMessageA(hwnd, WM_KEYDOWN, VK_ESCAPE, 0x00010001);
