@@ -6,6 +6,15 @@ slowedchat replaces the game's chat log with resizable, tabbed ImGui windows. Li
 
 Built and tested on the PhoenixXI private server with Ashita v4.3.
 
+> [!WARNING]
+> **Use at your own risk.** slowedchat was built as a personal addon for my own setup, and it's shared as-is.
+>
+> - **It's tuned to one setup.** Some behavior was tuned by hand for one screen size, game setup and play style, and may need adjusting for yours.
+> - **Many settings are complicated.** Several interact with each other (sliding vs. fading, hiding the game's chat, the input bar) and can take some trial and error to get right.
+> - **Some features modify game memory.** Hiding the game's chat windows, compass and clock, and reading menu sizes, change or read the game client's memory. They're built to fail safe, but there's no guarantee they won't misbehave on another client or server.
+>
+> No support is promised. If something goes wrong, unload it with `/addon unload slowedchat`.
+
 ---
 
 ## Features
