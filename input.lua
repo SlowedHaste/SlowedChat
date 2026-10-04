@@ -76,6 +76,61 @@ local VK_CHAR_SLASH = 0x2F; -- '/' as a WM_CHAR character code.
 local pGameMenu     = ashita.memory.find('FFXiMain.dll', 0, '8B480C85C974??8B510885D274??3B05', 16, 0);
 local pEventSystem  = ashita.memory.find('FFXiMain.dll', 0, 'A0????????84C0741AA1????????85C0741166A1????????663B05????????0F94C0C3', 0, 0);
 
+--[[
+* Returns the address of the focused game menu's data (where its name lives
+* at +0x46), or nil. Used by '/schat menudump' to find its size/position.
+--]]
+input.menu_header = function ()
+    if (pGameMenu == 0) then
+        return nil;
+    end
+    local p = ashita.memory.read_uint32(pGameMenu);
+    if (p == 0) then return nil; end
+    p = ashita.memory.read_uint32(p);
+    if (p == 0) then return nil; end
+    p = ashita.memory.read_uint32(p + 4);
+    if (p == 0) then return nil; end
+    return p;
+end
+
+--[[
+* Returns the focused game menu's screen rectangle in pixels (left, top, right,
+* bottom; y down), or nil. The game keeps it as four int16s at +0x10 of the
+* menu data, in its menu resolution (boot config registry 0037/0038), which is
+* stretched to the window. (Found with '/schat menudump'.)
+*
+* x1/x2 are the left/right edges and match the screen. The y values do NOT:
+* the same player menu read y 128..296 once and 728..896 later in the same
+* place, and the Mog House menu (208..328) sat at ~1054..1190 of 1440. They're
+* relative to something else, so callers should only rely on x. (y is still
+* returned, scaled, for '/schat status'.)
+--]]
+input.menu_rect = function ()
+    local h = input.menu_header();
+    if (h == nil) then
+        return nil;
+    end
+    local x1 = ashita.memory.read_int16(h + 0x10);
+    local y1 = ashita.memory.read_int16(h + 0x12);
+    local x2 = ashita.memory.read_int16(h + 0x14);
+    local y2 = ashita.memory.read_int16(h + 0x16);
+
+    local cfg = AshitaCore:GetConfigurationManager();
+    local mw = cfg:GetInt32('boot', 'ffxi.registry', '0037', -1);
+    local mh = cfg:GetInt32('boot', 'ffxi.registry', '0038', -1);
+    local ds = imgui.GetIO().DisplaySize;
+    if (mw <= 0 or mh <= 0) then
+        mw, mh = ds.x, ds.y;    -- No menu resolution set: menus use the window size.
+    end
+
+    -- Sanity: a real rectangle inside the menu resolution..
+    if (x1 < 0 or y1 < 0 or x2 <= x1 or y2 <= y1 or x2 > mw or y2 > mh) then
+        return nil;
+    end
+    local sx, sy = ds.x / mw, ds.y / mh;
+    return x1 * sx, y1 * sy, x2 * sx, y2 * sy;
+end
+
 input.menu_name = function ()
     if (pGameMenu == 0) then
         return '';
@@ -89,17 +144,11 @@ input.menu_name = function ()
     return (ashita.memory.read_string(p + 0x46, 16):gsub('%z', ''):gsub('%s+$', ''));
 end
 
--- Game menus that do NOT fade the chat: they open on the right side of the
--- screen, away from it. (Short names, without the 'menu' prefix; from XIUI's
--- menu list.) Every other menu (player menu, NPC options, Yes/No confirmations,
--- Mog House ...) fades it. '/schat fade' overrides either way. (s.menu_fade)
-local RIGHT_SIDE_MENUS = {
-    magselec = true,    -- Magic side menu.
-    magic    = true,    -- Magic / Trust list.
-    abiselec = true,    -- Abilities side menu.
-    ability  = true,    -- Job abilities, weapon skills, pet commands.
-    mount    = true,    -- Mount list.
-};
+-- Game menus that leave the chat alone. (Short names, without the 'menu'
+-- prefix.) Empty by default: every menu (player menu, abilities, magic, items,
+-- NPC options, Yes/No confirmations, Mog House ...) slides or fades the chat.
+-- '/schat fade' overrides either way. (s.menu_fade)
+local RIGHT_SIDE_MENUS = { };
 
 --[[
 * Returns the short name of a game menu. ('menu    myroom' -> 'myroom')
@@ -255,10 +304,11 @@ input.close = function (clear)
 end
 
 local function send(cmd)
-    -- AshitaParse (-1): Ashita and addons (/schat, /addon ...) see the command
-    -- first; anything they don't handle is forwarded to the game.
+    -- Typed (1): exactly as if the player typed it into the game's chat line,
+    -- so plugins that only act on typed input (Shorthand: '/cure4 <t>' ...)
+    -- and Ashita / addon commands (/schat, /addon ...) all see it.
     -- {Phrase} becomes a real auto-translate code; the rest goes to Shift-JIS..
-    AshitaCore:GetChatManager():QueueCommand(-1, at.encode(cmd));
+    AshitaCore:GetChatManager():QueueCommand(1, at.encode(cmd));
 end
 
 --[[
@@ -289,7 +339,10 @@ end
 * Handles a submitted line.
 --]]
 local function submit(s, text)
-    text = text:gsub('^%s+', ''):gsub('%s+$', ''):gsub('^//', '/');
+    -- Leave a leading '//' alone: it's Shorthand / Windower-style syntax
+    -- ('//provoke'). (A stray doubled '/' from opening the bar with the '/' key
+    -- is already blocked in on_key.)
+    text = text:gsub('^%s+', ''):gsub('%s+$', '');
     if (#text == 0 or text == '/') then
         return;
     end

@@ -243,4 +243,7 @@ nativechat.tick = function (wanted)
     end
 end
 
+-- Readable/writable check, shared with menu research. (See '/schat menudump')
+nativechat.valid = valid;
+
 return nativechat;

@@ -6,6 +6,7 @@ addon.link      = '';
 
 require 'common';
 
+local ffi       = require 'ffi';
 local chat      = require 'chat';
 local imgui     = require 'imgui';
 local settings  = require 'settings';
@@ -51,6 +52,11 @@ local default_settings = T{
     locked          = false,
     menu_mode       = 'fade',       -- While a game menu is open: 'fade', 'hide' or 'off'.
     menu_alpha      = 0.15,         -- Opacity when faded.
+    menu_slide      = true,         -- Slide the chat right for game menus instead of fading it.
+    slide_auto      = true,         -- Slide just past the open menu's right edge. (Reads its size.)
+    slide_margin    = 20,           -- Gap between the menu and the chat when sliding automatically.
+    item_info_slide = 700,          -- Slide distance in item lists, to clear the item details box.
+    slide_dist      = 400,          -- Fixed slide distance when slide_auto is off. (Also set by dragging it while slid.)
     show_mode_ids   = false,        -- Prefix lines with their chat mode id. (For '/schat map'.)
     windows = T{
         main = T{ x = 20,  y = 480, w = 520, h = 260, visible = true, tab = '' },
@@ -151,6 +157,7 @@ local state = {
     party       = { },      -- Cached party/alliance member names.
     party_time  = 0,
     fade        = 1.0,      -- Chat window opacity multiplier. (Lowered while game menus are open.)
+    slide_on    = false,    -- A game menu wants the chat slid aside. (See update_fade)
     captured    = 0,        -- Lines captured this session. (For '/schat status'.)
     blocked     = 0,        -- Lines hidden from the game's log this session.
 };
@@ -377,7 +384,7 @@ local function print_help(isError)
         { '/schat', 'Toggles the settings window.' },
         { '/schat layout (single | dual)', 'One tabbed window, or Chat + Log windows.' },
         { '/schat native', 'Toggles hiding the game\'s own chat log.' },
-        { '/schat fade', 'With a game menu open: toggles whether that menu fades the chat.' },
+        { '/schat fade','With a game menu open: toggles whether that menu fades the chat.' },
         { '/schat window','Toggles hiding the game\'s chat windows themselves.' },
         { '/schat input','Toggles using slowedchat\'s input bar instead of the game\'s.' },
         { '/schat status', 'Prints diagnostic information.' },
@@ -449,6 +456,115 @@ ashita.events.register('command', 'command_cb', function (e)
         return;
     end
 
+    -- Handle: /schat menudump - Writes the open menu's raw data to menudump.log.
+    -- (Research: finding where the game keeps a menu's on-screen size/position.)
+    if (args[2]:any('menudump')) then
+        local header = input.menu_header();
+        local name = input.menu_name();
+        if (header == nil or name == '') then
+            print(chat.header(addon.name):append(chat.error('No game menu is open. Open one, then press / and type /schat menudump.')));
+            return;
+        end
+
+        local dir = addon.path or (AshitaCore:GetInstallPath():gsub('\\$', '') .. '\\addons\\slowedchat\\');
+        local f = io.open(dir:gsub('[\\/]$', '') .. '\\menudump.log', 'a');
+        if (f == nil) then
+            print(chat.header(addon.name):append(chat.error('Could not write menudump.log.')));
+            return;
+        end
+
+        local w, h = imgui.GetIO().DisplaySize and imgui.GetIO().DisplaySize.x, imgui.GetIO().DisplaySize and imgui.GetIO().DisplaySize.y;
+        f:write(('[%s] menu "%s" header 0x%08X screen %sx%s\n'):fmt(os.date('%H:%M:%S'), name, header, tostring(w), tostring(h)));
+        for row = 0, 0x17F, 16 do
+            local hex, s16 = { }, { };
+            for i = 0, 15 do
+                hex[#hex + 1] = ('%02X'):fmt(ashita.memory.read_uint8(header + row + i));
+            end
+            for i = 0, 14, 2 do
+                s16[#s16 + 1] = ('%6d'):fmt(ashita.memory.read_int16(header + row + i));
+            end
+            f:write(('  +%03X  %s  | %s\n'):fmt(row, table.concat(hex, ' '), table.concat(s16, ' ')));
+        end
+
+        -- Every menu block near this one: name (at +0x46) and raw rectangle
+        -- (4 int16 at +0x10). Read-only; the region is checked readable first.
+        local span = 0x8000;
+        local start = header - span;
+        local ok_read = nativechat.valid(start, span * 2, false);
+        if (not ok_read) then
+            start, span = header, span;     -- Fall back to just after the header..
+            ok_read = nativechat.valid(start, span, false);
+        end
+        if (ok_read) then
+            local size = (start == header) and span or span * 2;
+            local blob = ffi.string(ffi.cast('const char*', start), size);
+            local function i16(o)
+                local lo, hi = blob:byte(o + 1), blob:byte(o + 2);
+                local v = lo + hi * 256;
+                return (v >= 0x8000) and (v - 0x10000) or v;
+            end
+            f:write('  nearby menu blocks (offset from focused, name, raw x1 y1 x2 y2):\n');
+            local pos = 1;
+            while (true) do
+                local a = blob:find('menu    ', pos, true);
+                if (a == nil) then
+                    break;
+                end
+                local o = (a - 1) - 0x46;       -- Block start, relative to blob.
+                if (o >= 0 and o + 0x18 <= #blob) then
+                    local nm = blob:sub(a, a + 15):gsub('%z.*', '');
+                    f:write(('    %+7d  %-16s  %5d %5d %5d %5d\n'):fmt((start + o) - header, nm,
+                        i16(o + 0x10), i16(o + 0x12), i16(o + 0x14), i16(o + 0x16)));
+                end
+                pos = a + 8;
+            end
+        else
+            f:write('  (nearby memory not readable; skipped)\n');
+        end
+
+        -- Follow each of the block's first pointers as a chain, logging any menu
+        -- reached (directly, or via a node whose +4 points at a menu block, like
+        -- the focused-menu chain). Looking for the list of open windows.
+        local function menu_at(p)
+            if (p == 0 or not nativechat.valid(p + 0x10, 0x46, false)) then
+                return nil;
+            end
+            local nm = ffi.string(ffi.cast('const char*', p + 0x46), 16):gsub('%z.*', '');
+            if (nm:sub(1, 8) ~= 'menu    ') then
+                return nil;
+            end
+            return nm, ashita.memory.read_int16(p + 0x10), ashita.memory.read_int16(p + 0x12),
+                ashita.memory.read_int16(p + 0x14), ashita.memory.read_int16(p + 0x16);
+        end
+        for _, off in ipairs({ 0x04, 0x08, 0x0C }) do
+            f:write(('  chain via +0x%02X:\n'):fmt(off));
+            local p, seen = header, { };
+            for step = 1, 24 do
+                if (p == 0 or seen[p] or not nativechat.valid(p + off, 4, false)) then
+                    break;
+                end
+                seen[p] = true;
+                p = ashita.memory.read_uint32(p + off);
+                local nm, a, b, c, d = menu_at(p);
+                local via = '';
+                if (nm == nil and p ~= 0 and nativechat.valid(p + 4, 4, false)) then
+                    nm, a, b, c, d = menu_at(ashita.memory.read_uint32(p + 4));
+                    via = ' (via +4)';
+                end
+                if (nm ~= nil) then
+                    f:write(('    %2d  0x%08X  %-16s  %5d %5d %5d %5d%s\n'):fmt(step, p, nm, a, b, c, d, via));
+                else
+                    f:write(('    %2d  0x%08X  (not a menu)\n'):fmt(step, p));
+                end
+            end
+        end
+
+        f:write('\n');
+        f:close();
+        print(chat.header(addon.name):append(chat.message('Menu data written to menudump.log for: ')):append(chat.success(input.short_name(name))));
+        return;
+    end
+
     -- Handle: /schat fade - Toggles whether the game menu that's open now fades the chat.
     if (args[2]:any('fade')) then
         local name = input.menu_name();
@@ -502,8 +618,14 @@ ashita.events.register('command', 'command_cb', function (e)
         for k, v in pairs(s.menu_fade or { }) do
             choices:append(('%s %s'):fmt(input.short_name(k), v and '(fades)' or '(doesn\'t fade)'));
         end
-        line('Menu fade overrides', #choices > 0 and choices:concat(', ') or 'none (all menus fade except right-side lists)');
+        line('Menu fade overrides', #choices > 0 and choices:concat(', ') or 'none (every menu slides/fades the chat)');
         line('Game menu open now (fades chat)', ('%s "%s"'):fmt(tostring(input.game_menu_open(s)), input.menu_name()));
+        local ml, mt, mr, mb = input.menu_rect();
+        if (ml ~= nil) then
+            ml, mt, mr, mb = math.floor(ml), math.floor(mt), math.floor(mr), math.floor(mb);
+        end
+        local cw = s.windows.main;
+        line('Open menu on screen / chat window', ml and ('x %d-%d y %d-%d  /  x %d-%d y %d-%d'):fmt(ml, mr, mt, mb, cw.x, cw.x + cw.w, cw.y, cw.y + cw.h) or 'no menu');
         local learned = T{ };
         for k, _ in pairs(s.chat_menus or { }) do
             learned:append(('"%s"'):fmt(k));
@@ -823,6 +945,22 @@ local function render_tabs(win, ws, reveal)
 end
 
 --[[
+* Returns true for item-list menus (inventory, bags), which show an item
+* details box. The box is a display, not a menu, and couldn't be found in
+* memory, so these slide a fixed distance (item_info_slide) instead of fitting.
+* 'inventor' is confirmed; the other name fragments are best guesses.
+--]]
+local ITEM_LISTS = { 'invent', 'item', 'bag', 'sack', 'case', 'wardrob', 'safe', 'stora', 'locker' };
+local function is_item_list(short)
+    for _, p in ipairs(ITEM_LISTS) do
+        if (short:find(p, 1, true)) then
+            return true;
+        end
+    end
+    return false;
+end
+
+--[[
 * Eases the chat windows toward faded/hidden while a game menu is open.
 *
 * ImGui always draws above the game's own UI, so the windows can't sit behind a
@@ -830,16 +968,68 @@ end
 --]]
 local function update_fade()
     local s = state.settings;
+
+    -- Game menus (the player menu is always up while engaged) slide the chat
+    -- aside instead of fading it, when enabled. NPC conversations never fade
+    -- it on their own: their dialog is read here. (Dialogue options are a
+    -- menu, so the chat slides out of their way like any other.)
+    local menu = input.game_menu_open(s);
+    local slide = s.menu_slide and menu;
+
     local target = 1.0;
-    if (s.menu_mode ~= 'off' and not input.active and (input.game_menu_open(s) or input.event_active())) then
+    if (s.menu_mode ~= 'off' and not input.active and not slide and menu) then
         target = (s.menu_mode == 'hide') and 0.0 or s.menu_alpha;
     end
 
     local dt = imgui.GetIO().DeltaTime or 0.016;
-    state.fade = state.fade + (target - state.fade) * math.min(1.0, dt * 12.0);
+    local k = math.min(1.0, dt * 12.0);
+
+    state.fade = state.fade + (target - state.fade) * k;
     if (math.abs(target - state.fade) < 0.01) then
         state.fade = target;
     end
+
+    -- What the windows slide past: the open menu's screen rectangle (auto), or
+    -- the fixed distance. (Each window works out its own offset in render_window.)
+    state.slide_on = slide;
+    state.menu_rect = nil;
+    state.menu_items = slide and is_item_list(input.short_name(input.menu_name()));
+    if (slide and s.slide_auto) then
+        local l, t, r, b = input.menu_rect();
+        if (l ~= nil) then
+            state.menu_rect = { l, t, r, b };
+        end
+    end
+end
+
+--[[
+* Returns how far (pixels) a chat window should sit to the right of its saved
+* position right now, and whether it's in the manual, drag-to-set mode.
+--]]
+local function slide_target(s, ws)
+    if (not state.slide_on) then
+        return 0, false;
+    end
+    -- Item lists: the item details box is a display, not a menu, so its size
+    -- and place can't be read. Slide a fixed distance for it, whether or not
+    -- the list itself overlaps the chat..
+    if (state.menu_items) then
+        return s.item_info_slide, false;
+    end
+
+    local m = state.menu_rect;
+    if (s.slide_auto and m ~= nil) then
+        -- Only move for a menu that overlaps this window horizontally; menus
+        -- further right are ignored. (Vertical isn't checked: the game's y
+        -- values proved relative to something else, not screen positions.)
+        local l, r = m[1], m[3];
+        if (l >= ws.x + ws.w or r <= ws.x) then
+            return 0, false;
+        end
+        -- ..and then just clear its right edge.
+        return math.max(0, r + s.slide_margin - ws.x), false;
+    end
+    return s.slide_dist, not s.slide_auto;
 end
 
 --[[
@@ -862,8 +1052,34 @@ local function render_window(win)
     win.reveal = (win.reveal or 1.0) + (target - (win.reveal or 1.0)) * math.min(1.0, dt * 10.0);
     local reveal = win.reveal;
 
+    -- Slid aside for a game menu: ease the offset toward the target (which
+    -- follows the menu's size in auto mode). In manual mode, once fully aside
+    -- the window is left free so dragging it sets the distance.
+    local goal, manual = slide_target(s, ws);
+    local off = win.slide_px or 0;
+    off = off + (goal - off) * math.min(1.0, dt * 12.0);
+    if (math.abs(goal - off) < 0.5) then
+        off = goal;
+    end
+    win.slide_px = off;
+
+    local slid = manual and off == goal and goal > 0;   -- Manual, fully aside: free to drag.
+    local sliding = off > 0 and not slid;               -- Placed by us this frame.
     local cond = state.reset_pos and ImGuiCond_Always or ImGuiCond_FirstUseEver;
-    imgui.SetNextWindowPos({ ws.x, ws.y }, cond);
+
+    -- Just finished sliding back: put it exactly on its saved spot. Otherwise it
+    -- stays where the last (fractional) animation frame left it, and that spot
+    -- gets saved as the new position, drifting right a little every slide.
+    local landing = off == 0 and (win.was_offset or false);
+    win.was_offset = off > 0;
+
+    if (sliding) then
+        imgui.SetNextWindowPos({ ws.x + off, ws.y }, ImGuiCond_Always);
+    elseif (landing) then
+        imgui.SetNextWindowPos({ ws.x, ws.y }, ImGuiCond_Always);
+    elseif (not slid) then
+        imgui.SetNextWindowPos({ ws.x, ws.y }, cond);
+    end
     imgui.SetNextWindowSize({ ws.w, ws.h }, cond);
     imgui.SetNextWindowBgAlpha(s.idle_bg_alpha + (s.bg_alpha - s.idle_bg_alpha) * (s.hover_reveal and reveal or 1.0));
 
@@ -894,8 +1110,19 @@ local function render_window(win)
         local w, h = imgui.GetWindowSize();
         x, y = math.floor(x + 0.5), math.floor(y + 0.5);
         w, h = math.floor(w + 0.5), math.floor(h + 0.5);
-        if (x ~= ws.x or y ~= ws.y or w ~= ws.w or h ~= ws.h) then
-            ws.x, ws.y, ws.w, ws.h = x, y, w, h;
+        if (w ~= ws.w or h ~= ws.h) then
+            ws.w, ws.h = w, h;
+            state.pending_save = true;
+        end
+        if (slid) then
+            -- Aside for the player menu: a drag sets the slide distance (and height)..
+            if (math.abs((x - ws.x) - s.slide_dist) >= 1 or y ~= ws.y) then
+                s.slide_dist = x - ws.x;
+                ws.y = y;
+                state.pending_save = true;
+            end
+        elseif (not sliding and (x ~= ws.x or y ~= ws.y)) then
+            ws.x, ws.y = x, y;
             state.pending_save = true;
         end
 
@@ -1081,7 +1308,7 @@ local function render_config()
 
         if (imgui.CollapsingHeader('Behavior', open)) then
             checkbox('Type in slowedchat  (Enter / \'/\' opens its input bar)', 'custom_input');
-            imgui.Text('While a game menu or NPC dialog is open:');
+            imgui.Text('While a game menu is open (when not sliding):');
             for _, m in ipairs({ { 'fade', 'Fade' }, { 'hide', 'Hide' }, { 'off', 'Stay visible' } }) do
                 imgui.SameLine();
                 if (imgui.RadioButton(m[2] .. '##menu_mode', s.menu_mode == m[1])) then
@@ -1091,6 +1318,20 @@ local function render_config()
             end
             if (s.menu_mode == 'fade') then
                 slider('Faded opacity', 'menu_alpha', 0.0, 0.8, '%.2f');
+            end
+            checkbox('Slide aside for game menus instead of fading', 'menu_slide');
+            if (s.menu_slide) then
+                imgui.Indent();
+                checkbox('Fit to the open menu\'s size', 'slide_auto');
+                if (s.slide_auto) then
+                    slider('Gap after the menu', 'slide_margin', 0, 200, nil, true);
+                    slider('Slide in item lists', 'item_info_slide', 0, 1200, nil, true);
+                    hint('(inventory / bags, for the item details box)');
+                else
+                    slider('Slide distance', 'slide_dist', 0, 1200, nil, true);
+                    hint('(or drag the chat while a menu is open)');
+                end
+                imgui.Unindent();
             end
             slider('Lines kept per tab', 'max_lines', 50, 1000, nil, true);
             imgui.Spacing();
